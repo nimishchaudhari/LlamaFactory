@@ -177,9 +177,19 @@ class SDFTVLLMEngine:
             # Save full model weights
             torch.save(underlying.state_dict(), os.path.join(save_dir, "pytorch_model.bin"))
 
-            # Save model config for vLLM compatibility
+            # Save model config
             if hasattr(underlying, "config"):
                 underlying.config.save_pretrained(save_dir)
+
+            # Save stub preprocessor config (required by vLLM for Qwen3/multi-modal architectures)
+            _write_preprocessor_config(save_dir)
+
+            # Save generation config
+            if hasattr(model, "generation_config"):
+                try:
+                    model.generation_config.save_pretrained(save_dir)
+                except Exception:
+                    pass
 
             # Restore LoRA training state
             model.unmerge_adapter()
@@ -188,3 +198,26 @@ class SDFTVLLMEngine:
             torch.save(model.state_dict(), os.path.join(save_dir, "pytorch_model.bin"))
             if HAS_CONFIG:
                 model.config.save_pretrained(save_dir)
+            _write_preprocessor_config(save_dir)
+
+
+def _write_preprocessor_config(save_dir: str) -> None:
+    """Write a stub preprocessor config to satisfy vLLM's model loader.
+
+    Some architectures (e.g., Qwen3) trigger vLLM's multi-modal processor
+    loading even for text-only models. This stub tells vLLM there is no
+    image/video processor, allowing text-only generation to proceed.
+    """
+    import json
+
+    preprocessor_path = os.path.join(save_dir, "preprocessor_config.json")
+    if not os.path.exists(preprocessor_path):
+        with open(preprocessor_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "image_processor_type": None,
+                    "feature_extractor_type": None,
+                    "processor_class": "AutoProcessor",
+                },
+                f,
+            )
