@@ -1,0 +1,228 @@
+# =============================================================================
+# SDFT Tool-Calling Fine-Tuning — Ternary-Bonsai-8B on glaive-toolcall-v2
+# =============================================================================
+#
+# This config fine-tunes prism-ml/Ternary-Bonsai-8B-unpacked (a ternary-
+# quantized Llama-3.1-8B-Instruct that loads as standard FP16) for tool
+# calling using Self-Distillation Fine-Tuning (SDFT).
+#
+# Why SDFT for tool calling? Standard SFT on function-calling datasets
+# often degrades general instruction-following (catastrophic forgetting).
+# SDFT's demonstration-conditioned teacher provides on-policy
+# regularization: the teacher sees few-shot tool-calling examples, the
+# student doesn't, producing a KL signal that guides learning while
+# preserving the base model's behavior.
+#
+# Dataset: glaive-function-calling-v2-sharegpt (~100k conversations)
+#   - Each example includes messages + a list of available tools
+#   - The model learns to generate correct JSON tool calls given a
+#     user query and a set of tool definitions
+#
+# Quick start (single GPU, minimal memory):
+#   CUDA_VISIBLE_DEVICES=0 llmf train examples/sdft/sdft_toolcall_config.yaml
+#
+# For 8B models with SDFT (2 forward passes + generation):
+#   - 1× A100 80GB: recommended (full sequence length)
+#   - 2× A6000 48GB: works with cutoff_len=2048, batch=1
+#   - 2× RTX 3090/4090 24GB: tight — reduce max_new_tokens to 256
+#   - 1× 24GB: likely OOM — use model_name_or_path: Qwen/Qwen3.5-4B instead
+#
+# Memory optimization tips:
+#   - Reduce cutoff_len to 1024 (tool definitions can be long)
+#   - Reduce max_new_tokens to 128 (tool calls are short JSON)
+#   - Set num_demonstrations: 1 (fewer demo examples in teacher prompt)
+#   - Use gradient_checkpointing: true (trades speed for memory)
+# =============================================================================
+
+
+# ---------------------------------------------------------------------------
+# MODEL — Ternary-Bonsai-8B (ternary-quantized Llama-3.1, loads as FP16)
+# ---------------------------------------------------------------------------
+model_name_or_path: prism-ml/Ternary-Bonsai-8B-unpacked
+  # Unpacked ternary model — loads as standard 16-bit weights.
+  # Architecture: meta-llama/Llama-3.1-8B-Instruct
+  # If out of memory, try:
+  #   model_name_or_path: Qwen/Qwen3.5-4B  (smaller, also tool-calling capable)
+
+template: qwen3
+  # Must match the model's native chat format. llama3 uses:
+  #   <|start_header_id|>role<|end_header_id|>\n\ncontent<|eot_id|>
+  # Tool calls use the llama3 JSON format.
+
+finetuning_type: lora
+  # LoRA is required for 8B models under most GPU budgets.
+  # Full fine-tuning would need ~64GB+ for SDFT (3 copies: student + lora + teacher).
+
+
+# ---------------------------------------------------------------------------
+# TRAINING STAGE
+# ---------------------------------------------------------------------------
+stage: sdft
+do_train: true
+
+
+# ---------------------------------------------------------------------------
+# SDFT LOSS PARAMETERS
+# ---------------------------------------------------------------------------
+alpha: 0.0
+  # 0.0 = forward KL (student || teacher) — mode-seeking
+  # This means: push the student toward the most likely teacher outputs.
+  # Good for tool calling where we want precise JSON structure.
+
+beta: 0.01
+  # KL regularization toward the FROZEN initial model.
+  # Prevents the model from drifting too far from its base capabilities
+  # (important: we want to preserve general instruction-following).
+
+num_loss_tokens_to_skip: 3
+  # Skip the first 3 completion tokens in the loss calculation.
+  # Tool call completions typically start with "<tool_call>" or "{",
+  # and these prefix tokens are often deterministic/uninformative.
+
+top_entropy_quantile: 0.8
+  # Apply loss only to the 20% most uncertain tokens.
+  # 0.8 is the standard default; increase to 1.0 for all tokens.
+
+num_demonstrations: 2
+  # Number of past training examples prepended to the teacher prompt.
+  # With 2 demos, the teacher sees:
+  #   [example_1 user + tool_calls] [example_2 user + tool_calls] [current user + tools]
+  # The student sees only: [current user + tools]
+  # This difference produces a non-zero KL signal.
+  #
+  # Tool-calling datasets benefit from demos because they teach the
+  # teacher what a valid function call looks like for each tool format.
+  # Reduce to 1 for shorter prompts (memory savings).
+
+
+# ---------------------------------------------------------------------------
+# TEACHER MODEL
+# ---------------------------------------------------------------------------
+teacher_model_name: null
+  # null = use the SAME model as both student and teacher.
+  # The KL signal comes purely from demonstration conditioning.
+  # For a stronger signal, set to a larger model:
+  #   teacher_model_name: meta-llama/Llama-3.1-70B-Instruct
+  #   (requires enough VRAM for both models simultaneously)
+
+sync_teacher_every: 1
+  # Copy student weights to teacher every N steps.
+  # 1 = every step (teacher stays in sync as the student learns).
+  # 0 = teacher frozen at initial weights (less memory, weaker signal).
+
+
+# ---------------------------------------------------------------------------
+# ON-POLICY GENERATION
+# ---------------------------------------------------------------------------
+temperature: 1.0
+  # Sampling temperature. 1.0 = natural distribution.
+  # For tool calling, consider 0.8 for more deterministic JSON output.
+
+top_p: 1.0
+  # Nucleus sampling. 1.0 = disabled (sample from full distribution).
+
+num_generations: 1
+  # Number of completions per prompt. More = better coverage.
+  # Increase to 2-4 for richer KL signal (costs more GPU cycles).
+
+max_new_tokens: 512
+  # Max tokens per completion. Tool calls are typically 50-200 tokens.
+  # Reduce to 256 on 24GB GPUs, to 128 on tighter budgets.
+
+use_vllm_for_generation: true
+  # Note: currently a no-op (falls back to model.generate()).
+  # Full vLLM integration is planned for faster on-policy sampling.
+
+
+# ---------------------------------------------------------------------------
+# DATASET — glaive-function-calling-v2 (100k tool-calling conversations)
+# ---------------------------------------------------------------------------
+dataset: glaive_toolcall_100k
+  # Built-in dataset (hiyouga/glaive-function-calling-v2-sharegpt on HF).
+  #
+  # Other tool-calling dataset options:
+  #   dataset: glaive_toolcall_en          # ~5k English examples (smaller, faster)
+  #   dataset: glaive_toolcall_zh          # Chinese tool calling examples
+  #
+  # Custom datasets can be added to data/dataset_info.json:
+  #   "my_tool_data": {
+  #     "file_name": "my_tool_data.json",
+  #     "formatting": "sharegpt",
+  #     "columns": {"messages": "conversations", "tools": "tools"}
+  #   }
+
+cutoff_len: 2048
+  # Max tokenized sequence length. Tool definitions can be verbose;
+  # 2048 is a good starting point. Increase to 4096 if you see
+  # truncation warnings for tools-heavy examples.
+
+max_samples: 50000
+  # Process 50K samples from the dataset.
+  # Set to 100000 (or remove this line) for the full dataset.
+  # Remove entirely if you want all 100k examples.
+
+preprocessing_num_workers: 4
+
+
+# ---------------------------------------------------------------------------
+# OUTPUT
+# ---------------------------------------------------------------------------
+output_dir: saves/sdft-bonsai-toolcall
+logging_steps: 5
+save_steps: 200
+  # Save every 200 steps (adjust based on total steps).
+  # With 50k samples, batch=1, grad_accum=4, 4 GPUs:
+  #   steps_per_epoch = 50000 / (1*4*4) = 3125
+  #   saving every 200 steps = ~16 checkpoints per epoch.
+
+overwrite_output_dir: true
+
+
+# ---------------------------------------------------------------------------
+# LoRA CONFIGURATION
+# ---------------------------------------------------------------------------
+lora_rank: 16
+lora_alpha: 32
+lora_target: all
+  # Apply LoRA to all linear layers.
+  # For tool calling, the attention layers learn to attend to tool
+  # definitions; the MLP layers learn JSON generation patterns.
+
+
+# ---------------------------------------------------------------------------
+# TRAINING HYPERPARAMETERS
+# ---------------------------------------------------------------------------
+per_device_train_batch_size: 1
+  # SDFT does 2 forward passes (student + teacher) + generation per step.
+  # Keep at 1 to stay within GPU memory for 8B models.
+
+gradient_accumulation_steps: 4
+  # Effective batch size = 1 × 4 × num_gpus.
+  #   Single GPU: effective batch = 4
+  #   2 GPUs:     effective batch = 8
+  #   4 GPUs:     effective batch = 16
+  # Increase to 8 if training is unstable at low effective batch sizes.
+
+learning_rate: 5.0e-5
+  # Lower than typical SFT (1e-4) because SDFT has a stronger signal
+  # per sample (KL loss + cross-entropy). 5e-5 is a safe starting point.
+
+num_train_epochs: 1
+  # 1 full pass over 50k samples with effective batch=8 (~6250 steps).
+  # Increase to 2-3 for deeper tool-calling capability.
+  # For full 100k dataset: 1 epoch is usually sufficient.
+
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+
+bf16: true
+  # bfloat16 — requires Ampere or newer GPU (A100, A6000, RTX 3090, RTX 4090).
+  # Change to fp16: true for older GPUs (V100, T4).
+
+gradient_checkpointing: true
+  # Trades ~20% speed for ~30% memory savings.
+  # Recommended for 8B models, especially with SDFT's extra memory usage.
+  # Remove if you have 80GB+ VRAM and want max speed.
+
+ddp_timeout: 180000000
+  # Generous timeout for distributed training setup.
