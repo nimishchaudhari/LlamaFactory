@@ -251,16 +251,16 @@ class SDFTTrainerWrapper:
         self.tokenizer = tokenizer
         self.teacher_model = teacher_model
         self.data_collator = data_collator or SDFTDataCollator(tokenizer)
-        
-        # Ensure teacher is in eval mode, no gradients
-        if self.teacher_model:
+
+        # Track steps for teacher sync
+        self.global_step = 0
+
+        # Freeze teacher only if it's a separate model (not shared with student)
+        if self.teacher_model is not None and self.teacher_model is not base_trainer.model:
             self.teacher_model.eval()
             for p in self.teacher_model.parameters():
                 p.requires_grad = False
-                
-        # Track steps for teacher sync
-        self.global_step = 0
-        
+
         # Patch the base trainer's compute_loss
         self._original_compute_loss = base_trainer.compute_loss
         base_trainer.compute_loss = lambda model, inputs, return_outputs=False, **kwargs: self.compute_loss(
@@ -349,7 +349,13 @@ class SDFTTrainerWrapper:
         
         # 2. Build full sequences for forward pass
         student_seqs = [p + c for p, c in zip(prompts, completions)]
-        teacher_seqs = [f.get("teacher_prompt", p) + c for p, c, f in zip(prompts, completions, [inputs]*len(prompts))]
+
+        # Decode teacher prompt tokens to get teacher prompt text
+        teacher_prompts = [
+            self.tokenizer.decode(ids, skip_special_tokens=True)
+            for ids in inputs["teacher_input_ids"]
+        ]
+        teacher_seqs = [tp + c for tp, c in zip(teacher_prompts, completions)]
         
         # 3. Forward pass: student model
         student_enc = self.tokenizer(
