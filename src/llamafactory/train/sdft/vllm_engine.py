@@ -208,9 +208,8 @@ class SDFTVLLMEngine:
         LoRA without destroying the PeftModel wrapper, preserving the training
         state for continued fine-tuning.
 
-        The merged weights are saved as ``pytorch_model.bin`` alongside the
-        model config (``config.json``). Auxiliary config files should already
-        exist in ``save_dir`` from ``_download_auxiliary_configs``.
+        The merged weights are saved as ``model.safetensors`` alongside the
+        model config (``config.json``). vLLM loads safetensors natively.
         """
         has_lora = hasattr(model, "peft_config") and model.peft_config
 
@@ -224,20 +223,22 @@ class SDFTVLLMEngine:
             else:
                 underlying = model
 
-            # Save merged weights
-            torch.save(underlying.state_dict(), os.path.join(save_dir, "pytorch_model.bin"))
-
-            # Save model config (overwrites any config from auxiliary download)
-            if hasattr(underlying, "config"):
-                underlying.config.save_pretrained(save_dir)
+            # Save merged weights as safetensors (vLLM native, handles complex
+            # state_dicts with vision components, shared tensors, etc.)
+            underlying.save_pretrained(save_dir, safe_serialization=True)
 
             # Restore LoRA training state
             model.unmerge_adapter()
         else:
-            # No adapter: full fine-tune or frozen — save directly
-            torch.save(model.state_dict(), os.path.join(save_dir, "pytorch_model.bin"))
-            if hasattr(model, "config"):
-                model.config.save_pretrained(save_dir)
+            # No adapter: full fine-tune or frozen — save as safetensors
+            if hasattr(model, "save_pretrained"):
+                model.save_pretrained(save_dir, safe_serialization=True)
+            else:
+                from safetensors.torch import save_file
+
+                save_file(model.state_dict(), os.path.join(save_dir, "model.safetensors"))
+                if hasattr(model, "config"):
+                    model.config.save_pretrained(save_dir)
 
 
 def _download_auxiliary_configs(model_name_or_path: str, save_dir: str, disable_multimodal: bool = True) -> None:
