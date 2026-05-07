@@ -103,6 +103,8 @@ class SDFTVLLMEngine:
 
         # Build and initialize vLLM engine pointing at the ORIGINAL model
         try:
+            print(f"SDFTVLLMEngine: Initializing vLLM from {base_model_path}...")
+
             engine_kwargs = {
                 "model": base_model_path,
                 "trust_remote_code": True,
@@ -113,6 +115,7 @@ class SDFTVLLMEngine:
                 "disable_log_stats": True,
                 "enable_lora": self._lora_request is not None,
                 "max_lora_rank": 64,
+                "enforce_eager": True,  # skip CUDA graph capture for fast startup
             }
 
             # In text-only mode, skip multi-modal processor loading
@@ -128,6 +131,7 @@ class SDFTVLLMEngine:
                 skip_special_tokens=True,
             )
             self._initialized = True
+            print("SDFTVLLMEngine: vLLM initialized successfully.")
 
             # Register cleanup on process exit or interrupt (Ctrl+C)
             atexit.register(self._cleanup_workers)
