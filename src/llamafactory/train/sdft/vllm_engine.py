@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import atexit
 import gc
 import json
 import os
+import signal
 import tempfile
 from typing import TYPE_CHECKING, Optional
 
@@ -125,6 +127,11 @@ class SDFTVLLMEngine:
                 skip_special_tokens=True,
             )
             self._initialized = True
+
+            # Register cleanup on process exit or interrupt (Ctrl+C)
+            atexit.register(self._cleanup_workers)
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
         except Exception as e:
             print(f"SDFTVLLMEngine: Failed to initialize vLLM: {e}")
             self._llm = None
@@ -166,6 +173,32 @@ class SDFTVLLMEngine:
 
             shutil.rmtree(self._temp_dir, ignore_errors=True)
             self._temp_dir = None
+
+    def _signal_handler(self, signum, frame):
+        """Handle SIGINT/SIGTERM: clean up vLLM workers then re-raise."""
+        self.shutdown()
+        self._force_kill_workers()
+        raise KeyboardInterrupt
+
+    @staticmethod
+    def _cleanup_workers():
+        """Atexit handler: kill orphaned vLLM worker processes."""
+        SDFTVLLMEngine._force_kill_workers()
+
+    @staticmethod
+    def _force_kill_workers():
+        """Force-kill any lingering vLLM EngineCore processes."""
+        import subprocess
+
+        try:
+            # Kill vLLM worker processes spawned during this session
+            subprocess.run(
+                ["pkill", "-f", "vllm.*EngineCore"],
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _save_merged_weights(model, save_dir: str) -> None:
