@@ -151,82 +151,90 @@ class SDFTDataCollator:
 # =============================================================================
 # 3. SDFT Loss Utilities (KL divergence + entropy filtering)
 # =============================================================================
-def get_batch_logps(
-    logits: torch.FloatTensor, 
-    labels: torch.LongTensor, 
-    average_log_prob: bool = False
-) -> torch.FloatTensor:
-    """Compute log-probs per token, same as DPO/SDFT implementations"""
-    if logits.shape[:-1] != labels.shape:
-        logits = logits[:, :-1, :]
-        labels = labels[:, 1:]
-    
-    loss_mask = (labels != -100)
-    labels = labels.masked_fill(~loss_mask, 0)
-    
-    per_token_logps = torch.gather(
-        logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)
-    ).squeeze(2)
-    
-    if average_log_prob:
-        return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
-    return per_token_logps
+def get_full_distribution_logps(logits: torch.Tensor, shift: bool = True) -> torch.Tensor:
+    """Shift logits (predict position i+1) and compute full log-softmax over vocab.
 
+    Args:
+        logits: Raw logits [B, L, V]
+        shift: If True, drop last logit (no next token to predict from it)
 
-def compute_kl_divergence(
-    student_logps: torch.Tensor,
-    teacher_logps: torch.Tensor,
-    alpha: float,
-    mask: torch.Tensor
-) -> torch.Tensor:
+    Returns:
+        Full log-softmax distribution [B, L', V] where L' = L-1 if shift else L
     """
-    Compute KL divergence with alpha parameter:
-    - alpha=0: forward KL (student||teacher)
-    - alpha=1: reverse KL (teacher||student)  
-    - 0<alpha<1: Jensen-Shannon style
+    if shift:
+        logits = logits[:, :-1, :]
+    return F.log_softmax(logits, dim=-1)
+
+
+def compute_distribution_kl(
+    student_full_logps: torch.Tensor,  # [..., V]
+    teacher_full_logps: torch.Tensor,  # [..., V]
+    alpha: float,
+) -> torch.Tensor:
+    """Compute KL divergence between full vocabulary distributions.
+
+    Args:
+        student_full_logps: Student log-softmax over vocab [..., V]
+        teacher_full_logps: Teacher log-softmax over vocab [..., V]
+        alpha: 0=forward KL, 1=reverse KL, 0<x<1=Jensen-Shannon
+
+    Returns:
+        Per-token KL divergence [*] (summed over vocab dimension)
     """
     if alpha == 0.0:
-        # Forward KL: E_teacher[log(teacher/student)]
-        kl = F.kl_div(student_logps, teacher_logps, reduction='none', log_target=True)
+        kl_raw = F.kl_div(student_full_logps, teacher_full_logps, reduction="none", log_target=True)
     elif alpha == 1.0:
-        # Reverse KL: E_student[log(student/teacher)]
-        kl = F.kl_div(teacher_logps, student_logps, reduction='none', log_target=True)
+        kl_raw = F.kl_div(teacher_full_logps, student_full_logps, reduction="none", log_target=True)
     else:
-        # Jensen-Shannon: mixture distribution
+        a = torch.tensor(alpha, dtype=student_full_logps.dtype, device=student_full_logps.device)
         log_mix = torch.logaddexp(
-            student_logps + torch.log(torch.tensor(alpha)),
-            teacher_logps + torch.log(torch.tensor(1 - alpha))
+            student_full_logps + torch.log(1 - a),
+            teacher_full_logps + torch.log(a),
         )
-        kl = (alpha * F.kl_div(student_logps, log_mix, reduction='none', log_target=True) +
-              (1 - alpha) * F.kl_div(teacher_logps, log_mix, reduction='none', log_target=True))
-    
-    # Apply mask and reduce
-    masked_kl = kl * mask
-    return masked_kl.sum(-1) / mask.sum(-1).clamp(min=1.0)
+        kl_raw = a * F.kl_div(log_mix, teacher_full_logps, reduction="none", log_target=True) + (
+            1 - a
+        ) * F.kl_div(log_mix, student_full_logps, reduction="none", log_target=True)
+    return kl_raw.sum(dim=-1)  # sum over vocab → per-token KL
+
+
+def compute_entropy_from_logps(full_logps: torch.Tensor) -> torch.Tensor:
+    """Compute entropy H(p) = -sum(p * log(p)) from full log-softmax distribution.
+
+    Args:
+        full_logps: Log-softmax over vocab [*, V]
+
+    Returns:
+        Per-token entropy [*]
+    """
+    probs = full_logps.exp()
+    return -(probs * full_logps).sum(dim=-1)
 
 
 def filter_by_entropy(
-    logps: torch.Tensor, 
-    quantile: float, 
-    mask: torch.Tensor
+    entropy: torch.Tensor,
+    quantile: float,
+    mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Only compute loss on tokens with highest entropy (most uncertain)"""
+    """Only keep tokens with highest entropy (most uncertain).
+
+    Args:
+        entropy: Per-token entropy values [B, L]
+        quantile: Keep top 1-quantile fraction (e.g., 0.8 keeps top 20%)
+        mask: Base mask to restrict candidate pool [B, L]
+
+    Returns:
+        Float mask of same shape
+    """
     if quantile >= 1.0:
         return mask
-    
-    # Compute entropy per token (approx via log-prob variance)
-    entropy = -torch.exp(logps) * logps  # Simplified entropy estimate
-    entropy = entropy * mask
-    
-    # Find threshold for top-quantile
-    flat_entropy = entropy[mask.bool()].flatten()
-    if flat_entropy.numel() == 0:
+
+    masked_entropy = entropy * mask
+    flat = masked_entropy[mask.bool()]
+    if flat.numel() == 0:
         return mask
-        
-    threshold = torch.quantile(flat_entropy, 1 - quantile)
-    high_entropy_mask = (entropy >= threshold) & mask.bool()
-    
-    return high_entropy_mask.float()
+
+    threshold = torch.quantile(flat, 1 - quantile)
+    return ((masked_entropy >= threshold) & mask.bool()).float()
 
 
 # =============================================================================
@@ -278,152 +286,157 @@ class SDFTTrainerWrapper:
             t_param.data.copy_(s_param.data)
             
     def _generate_completions_on_policy(
-        self, 
-        prompts: List[str], 
+        self,
+        prompts: List[str],
         use_teacher: bool = False
-    ) -> List[List[int]]:
+    ) -> Tuple[List[str], List[torch.Tensor]]:
         """
         Generate completions using on-policy sampling.
-        Leverages LlamaFactory's vLLM integration if available (4A).
+        Returns (completions_text, completion_ids) where completion_ids are token ID tensors.
         """
         model = self.teacher_model if use_teacher else self.base.model
-        
-        # Check if vLLM is available in LlamaFactory
+
+        # --- vLLM path (returns text only, IDs reconstructed) ---
         try:
             from llamafactory.chat.vllm_engine import VLLMEngine
             if self.args.use_vllm_for_generation and hasattr(self.base, 'vllm_engine'):
-                # Use existing vLLM engine from LlamaFactory
-                completions = self.base.vllm_engine.generate(
+                completions_text = self.base.vllm_engine.generate(
                     prompts,
                     max_new_tokens=self.args.max_new_tokens,
                     temperature=self.args.temperature,
                     top_p=self.args.top_p,
                     n=self.args.num_generations
                 )
-                return completions
+                # Tokenize generated text to get IDs
+                completion_ids = [self.tokenizer.encode(c, add_special_tokens=False, return_tensors="pt")[0]
+                                  for c in completions_text]
+                return completions_text, completion_ids
         except ImportError:
             pass
-            
-        # Fallback: transformers generate
-        inputs = self.tokenizer(
-            prompts, 
-            padding=True, 
-            return_tensors="pt"
-        ).to(model.device)
-        
+
+        # --- Fallback: transformers generate ---
+        tokenizer_inputs = self.tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
+
         with torch.no_grad():
             outputs = model.generate(
-                **inputs,
+                **tokenizer_inputs,
                 max_new_tokens=self.args.max_new_tokens,
                 temperature=self.args.temperature,
                 top_p=self.args.top_p,
                 do_sample=True,
-                num_return_sequences=self.args.num_generations
+                num_return_sequences=self.args.num_generations,
             )
-        
-        # Decode and return
-        completions = []
-        for i, prompt in enumerate(prompts):
-            prompt_len = len(inputs["input_ids"][i])
+
+        completions_text = []
+        completion_ids = []
+        for i in range(len(prompts)):
+            prompt_len = len(tokenizer_inputs["input_ids"][i])
             for j in range(self.args.num_generations):
-                gen_ids = outputs[i * self.args.num_generations + j][prompt_len:]
-                completions.append(self.tokenizer.decode(gen_ids, skip_special_tokens=True))
-                
-        return completions
+                full_seq = outputs[i * self.args.num_generations + j]
+                gen_ids = full_seq[prompt_len:]
+                completions_text.append(self.tokenizer.decode(gen_ids, skip_special_tokens=True))
+                completion_ids.append(gen_ids)
+
+        return completions_text, completion_ids
         
     def compute_loss(
-        self, 
-        model, 
-        inputs: Dict[str, torch.Tensor], 
-        return_outputs: bool = False
+        self,
+        model,
+        inputs: Dict[str, torch.Tensor],
+        return_outputs: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict]]:
-        """
-        SDFT loss: KL(student||teacher) on on-policy generated completions
-        """
+        """SDFT loss: KL(student||teacher) between full vocabulary distributions
+        on on-policy generated completions."""
         self.global_step += 1
-        
-        # 1. Generate completions on-policy (from student)
-        prompts = [self.tokenizer.decode(ids, skip_special_tokens=True) 
-                  for ids in inputs["student_input_ids"]]
-        completions = self._generate_completions_on_policy(prompts, use_teacher=False)
-        
-        # 2. Build full sequences for forward pass
-        student_seqs = [p + c for p, c in zip(prompts, completions)]
 
-        # Decode teacher prompt tokens to get teacher prompt text
-        teacher_prompts = [
+        # 1. Decode student prompts and generate completions on-policy
+        prompts_text = [
             self.tokenizer.decode(ids, skip_special_tokens=True)
-            for ids in inputs["teacher_input_ids"]
+            for ids in inputs["student_input_ids"]
         ]
-        teacher_seqs = [tp + c for tp, c in zip(teacher_prompts, completions)]
-        
-        # 3. Forward pass: student model
-        student_enc = self.tokenizer(
-            student_seqs, padding=True, return_tensors="pt"
-        ).to(model.device)
-        student_outputs = model(**student_enc)
-        student_logps = get_batch_logps(
-            student_outputs.logits, 
-            student_enc["input_ids"], 
-            average_log_prob=False
+        _, completion_ids_list = self._generate_completions_on_policy(prompts_text, use_teacher=False)
+
+        # 2. Keep prompt as token IDs (from collator), pad completions
+        prompt_ids_list = [ids for ids in inputs["student_input_ids"]]
+        prompt_ids = torch.nn.utils.rnn.pad_sequence(
+            prompt_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
-        
-        # 4. Forward pass: teacher model (no grad)
+        completion_ids = torch.nn.utils.rnn.pad_sequence(
+            completion_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        )
+        completion_len = completion_ids.size(1)
+
+        # 3. Build full sequences (student: prompt + completion)
+        full_input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        full_attention = (full_input_ids != self.tokenizer.pad_token_id).long()
+        full_input_ids = full_input_ids.to(model.device)
+        full_attention = full_attention.to(model.device)
+
+        # 4. Student forward pass
+        student_outputs = model(input_ids=full_input_ids, attention_mask=full_attention)
+        student_logits = student_outputs.logits
+
+        # 5. Teacher forward pass (no grad) — with teacher_prompt + same completions
         with torch.no_grad():
-            teacher_enc = self.tokenizer(
-                teacher_seqs, padding=True, return_tensors="pt"
+            teacher_prompt_ids_list = [ids for ids in inputs.get("teacher_input_ids", inputs["student_input_ids"])]
+            teacher_prompt_ids = torch.nn.utils.rnn.pad_sequence(
+                teacher_prompt_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id
             ).to(self.teacher_model.device)
-            teacher_outputs = self.teacher_model(**teacher_enc)
-            teacher_logps = get_batch_logps(
-                teacher_outputs.logits,
-                teacher_enc["input_ids"],
-                average_log_prob=False
-            )
-        
-        # 5. Compute loss mask (skip first N tokens, apply response mask)
-        labels = student_enc["input_ids"].clone()
-        loss_mask = (labels != self.tokenizer.pad_token_id).float()
-        
-        # Skip initial tokens (e.g., prompt + special tokens)
+            teacher_full_ids = torch.cat([teacher_prompt_ids, completion_ids.to(self.teacher_model.device)], dim=1)
+            teacher_full_attn = (teacher_full_ids != self.tokenizer.pad_token_id).long()
+
+            teacher_outputs = self.teacher_model(input_ids=teacher_full_ids, attention_mask=teacher_full_attn)
+            teacher_logits = teacher_outputs.logits
+
+        # 6. Shift logits (pos i → predicts pos i+1) and trim to completion tokens
+        student_logits_comp = student_logits[:, -(completion_len + 1) : -1, :]  # [B, L_comp, V]
+        teacher_logits_comp = teacher_logits[:, -(completion_len + 1) : -1, :]
+
+        student_full_logps = get_full_distribution_logps(student_logits_comp, shift=False)
+        teacher_full_logps = get_full_distribution_logps(teacher_logits_comp, shift=False)
+
+        # 7. Completion mask (exclude pad tokens)
+        completion_mask = (completion_ids != self.tokenizer.pad_token_id).float().to(model.device)
+
+        # Skip first N completion tokens
         if self.args.num_loss_tokens_to_skip > 0:
-            loss_mask[:, :self.args.num_loss_tokens_to_skip] = 0
-            
-        # Only compute loss on completion tokens (not prompt)
-        # This assumes response starts after first eos_token
-        eos_positions = (labels == self.tokenizer.eos_token_id).float().argmax(dim=1)
-        for i, pos in enumerate(eos_positions):
-            if pos > 0:
-                loss_mask[i, :pos+1] = 0  # Mask prompt + eos
-        
-        # 6. Entropy-based token filtering
+            completion_mask[:, : self.args.num_loss_tokens_to_skip] = 0
+
+        # 8. Entropy-based token filtering (from full distribution)
         if self.args.top_entropy_quantile < 1.0:
-            loss_mask = loss_mask * filter_by_entropy(
-                student_logps, self.args.top_entropy_quantile, loss_mask
+            student_entropy = compute_entropy_from_logps(student_full_logps)
+            completion_mask = completion_mask * filter_by_entropy(
+                student_entropy, self.args.top_entropy_quantile, completion_mask
             )
-        
-        # 7. Compute KL divergence loss
-        kl_loss = compute_kl_divergence(
-            student_logps, teacher_logps, self.args.alpha, loss_mask
-        )
-        
-        # 8. Optional: KL regularization w.r.t. base model (beta term)
+
+        # 9. Compute KL divergence between full distributions
+        per_token_kl = compute_distribution_kl(
+            student_full_logps, teacher_full_logps, self.args.alpha
+        )  # [B, L_comp]
+
+        # 10. Apply mask and normalize
+        masked_kl = (per_token_kl * completion_mask).sum(dim=-1)
+        token_counts = completion_mask.sum(dim=-1).clamp(min=1.0)
+        kl_loss = (masked_kl / token_counts).mean()
+
+        # 11. Optional beta-KL to frozen reference model
         total_loss = kl_loss
-        if self.args.beta > 0.0 and hasattr(self.base, 'ref_model') and self.base.ref_model is not None:
+        if self.args.beta > 0.0 and hasattr(self.base, "ref_model") and self.base.ref_model is not None:
             with torch.no_grad():
-                ref_outputs = self.base.ref_model(**student_enc)
-                ref_logps = get_batch_logps(ref_outputs.logits, labels, average_log_prob=False)
-            reg_kl = compute_kl_divergence(student_logps, ref_logps, alpha=0.0, mask=loss_mask)
-            total_loss = total_loss + self.args.beta * reg_kl
-        
-        # 9. Sync teacher weights if needed
+                ref_outputs = self.base.ref_model(input_ids=full_input_ids, attention_mask=full_attention)
+                ref_logits_comp = ref_outputs.logits[:, -(completion_len + 1) : -1, :]
+                ref_full_logps = get_full_distribution_logps(ref_logits_comp, shift=False)
+            ref_kl = compute_distribution_kl(student_full_logps, ref_full_logps, alpha=0.0)
+            ref_masked_kl = (ref_kl * completion_mask).sum(dim=-1) / token_counts
+            total_loss = total_loss + self.args.beta * ref_masked_kl.mean()
+
+        # 12. Sync teacher weights if shared
         if self.args.teacher_model_name is None and self.global_step % self.args.sync_teacher_every == 0:
             self._sync_teacher_weights()
-        
-        loss = total_loss.mean()
-        
+
         if return_outputs:
-            return loss, {"kl_loss": kl_loss.detach(), "total_loss": loss.detach()}
-        return loss
+            return total_loss, {"kl_loss": kl_loss.detach(), "total_loss": total_loss.detach()}
+        return total_loss
         
     def restore(self):
         """Unpatch the base trainer (cleanup)"""
