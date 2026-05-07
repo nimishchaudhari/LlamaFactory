@@ -86,32 +86,34 @@ def run_sdft(
     )
 
     # Initialize vLLM engine for fast on-policy generation.
-    # vLLM only activates on single-GPU setups. With DDP (world_size > 1),
-    # we fall back to model.generate() — proper multi-GPU vLLM (tensor
-    # parallelism or broadcast) is planned for Phase 2.
+    # Each rank independently attempts to create a vLLM engine on its own GPU.
+    # If OOM or initialization fails, that rank falls back to model.generate().
+    # Memory budget (per GPU, with LoRA):
+    #   4B model: ~17GB training + ~8GB vLLM = ~25GB — tight on 24GB, lower gpu_memory_utilization to 0.7
+    #   8B model: ~17GB training + ~16GB vLLM = ~33GB — needs 40GB+ GPU or asymmetric setup
     vllm_engine = None
     if finetuning_args.use_vllm_for_generation:
         import torch.distributed as dist
 
         world_size = dist.get_world_size() if dist.is_initialized() else 1
-        if world_size == 1:
-            vllm_engine = SDFTVLLMEngine(
-                model=model,
-                tokenizer=tokenizer,
-                model_name_or_path=model_args.model_name_or_path,
-                cutoff_len=data_args.cutoff_len,
-                max_new_tokens=generating_args.max_new_tokens,
-                temperature=generating_args.temperature,
-                top_p=generating_args.top_p,
-                gpu_memory_utilization=getattr(finetuning_args, "vllm_gpu_memory_utilization", 0.85),
-                disable_multimodal=getattr(finetuning_args, "vllm_disable_multimodal", True),
-            )
-        else:
+        if world_size > 1:
             logger.info_rank0(
-                "vLLM disabled: world_size > 1 (DDP training). "
-                "Use CUDA_VISIBLE_DEVICES=0 for single-GPU vLLM training. "
-                "Multi-GPU vLLM support planned for Phase 2."
+                f"vLLM: world_size={world_size}. Each rank will independently create a vLLM engine. "
+                "Ensure each GPU has enough free memory (training model + vLLM copy). "
+                "If OOM occurs, individual ranks will fall back to model.generate()."
             )
+
+        vllm_engine = SDFTVLLMEngine(
+            model=model,
+            tokenizer=tokenizer,
+            model_name_or_path=model_args.model_name_or_path,
+            cutoff_len=data_args.cutoff_len,
+            max_new_tokens=generating_args.max_new_tokens,
+            temperature=generating_args.temperature,
+            top_p=generating_args.top_p,
+            gpu_memory_utilization=getattr(finetuning_args, "vllm_gpu_memory_utilization", 0.85),
+            disable_multimodal=getattr(finetuning_args, "vllm_disable_multimodal", True),
+        )
 
     # SDFT data collator (produces student/teacher input batches)
     data_collator = SDFTDataCollator(tokenizer, max_length=data_args.cutoff_len)
