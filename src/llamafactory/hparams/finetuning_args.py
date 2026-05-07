@@ -501,7 +501,15 @@ class FinetuningArguments(
     )
     use_vllm_for_generation: bool = field(
         default=True,
-        metadata={"help": "Use vLLM for on-policy generation"},
+        metadata={"help": "Use vLLM for on-policy generation (requires vLLM installed)"},
+    )
+    vllm_sync_every: int = field(
+        default=32,
+        metadata={"help": "Sync training weights to vLLM engine every N steps (0 = never, init only)"},
+    )
+    vllm_gpu_memory_utilization: float = field(
+        default=0.85,
+        metadata={"help": "Fraction of GPU memory reserved for vLLM engine (0.0-1.0)"},
     )
     # === END SDFT ===
 

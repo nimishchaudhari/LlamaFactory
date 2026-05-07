@@ -16,11 +16,13 @@
 # Single-file Self-Distillation Fine-Tuning (SDFT) plugin for LlamaFactory
 # Usage: from sdft_plugin import register_sdft; register_sdft()
 
+import logging
+from dataclasses import dataclass, field
+from typing import Optional, Union
+
 import torch
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple, Union
-from dataclasses import dataclass, field
-import logging
+
 
 logger = logging.getLogger(__name__)
 
@@ -32,27 +34,29 @@ logger = logging.getLogger(__name__)
 class SDFTArguments:
     """SDFT-specific hyperparameters - merge these into your training config"""
     stage: str = "sdft"  # Must match stage name in config.yaml
-    
+
     # Distillation parameters
     alpha: float = field(default=0.0, metadata={"help": "KL type: 0=forward, 1=reverse, 0<x<1=JS"})
     beta: float = field(default=0.0, metadata={"help": "KL coefficient w.r.t. base model for stability"})
-    
+
     # Loss masking
     num_loss_tokens_to_skip: int = field(default=3, metadata={"help": "Skip first N tokens in loss"})
     top_entropy_quantile: float = field(default=1.0, metadata={"help": "Only loss on top-quantile entropy tokens"})
-    
+
     # Teacher management
     teacher_model_name: Optional[str] = field(default=None, metadata={"help": "Path to teacher model (None = sync from student)"})
     sync_teacher_every: int = field(default=1, metadata={"help": "Sync teacher weights from student every N steps"})
-    
+
     # Generation (on-policy sampling)
     num_generations: int = field(default=1, metadata={"help": "Completions to sample per prompt"})
     max_new_tokens: int = field(default=256, metadata={"help": "Max new tokens for on-policy generation"})
     temperature: float = field(default=1.0)
     top_p: float = field(default=1.0)
-    
+
     # vLLM integration
-    use_vllm_for_generation: bool = field(default=True, metadata={"help": "Use LlamaFactory's vLLM for faster generation"})
+    use_vllm_for_generation: bool = field(default=True, metadata={"help": "Use vLLM for faster on-policy generation"})
+    vllm_sync_every: int = field(default=32, metadata={"help": "Sync training weights to vLLM every N steps (0=never)"})
+    vllm_gpu_memory_utilization: float = field(default=0.85, metadata={"help": "GPU memory fraction for vLLM"})
 
     # Demonstration buffer for teacher-conditioning
     num_demonstrations: int = field(default=2, metadata={"help": "Number of few-shot demos to prepend to teacher prompt"})
@@ -62,8 +66,7 @@ class SDFTArguments:
 # 2. Dual-Prompt Data Collator (supports teacher_prompt column)
 # =============================================================================
 class SDFTDataCollator:
-    """
-    Handles batch construction for SDFT.
+    """Handles batch construction for SDFT.
     Supports two input formats:
     1. Preprocessed (input_ids, labels) — extracts prompt from tokenized data.
     2. Raw text (prompt, teacher_prompt, response) — tokenizes on-the-fly.
@@ -74,7 +77,7 @@ class SDFTDataCollator:
         self.tokenizer = tokenizer
         self.max_length = max_length
 
-    def _extract_prompt_ids(self, feature: Dict) -> torch.Tensor:
+    def _extract_prompt_ids(self, feature: dict) -> torch.Tensor:
         """Extract prompt token ids from a preprocessed feature dict."""
         # Check for raw text columns first (fallback for raw datasets)
         if "prompt" in feature:
@@ -102,7 +105,7 @@ class SDFTDataCollator:
 
         return input_ids
 
-    def __call__(self, features: List[Dict]) -> Dict[str, torch.Tensor]:
+    def __call__(self, features: list[dict]) -> dict[str, torch.Tensor]:
         batch = {}
 
         # Extract student prompt ids
@@ -244,24 +247,25 @@ def filter_by_entropy(
 # 4. SDFT Trainer Wrapper (patches LlamaFactory's SFTTrainer)
 # =============================================================================
 class SDFTTrainerWrapper:
-    """
-    Minimal wrapper that adds SDFT logic to LlamaFactory's existing SFTTrainer.
+    """Minimal wrapper that adds SDFT logic to LlamaFactory's existing SFTTrainer.
     Does NOT inherit - instead, we override compute_loss via monkey-patch.
     """
-    
+
     def __init__(
         self,
         base_trainer,  # LlamaFactory's SFTTrainer instance
         sdft_args: SDFTArguments,
         teacher_model,
         tokenizer,
-        data_collator: Optional[SDFTDataCollator] = None
+        data_collator: Optional[SDFTDataCollator] = None,
+        vllm_engine=None,
     ):
         self.base = base_trainer
         self.args = sdft_args
         self.tokenizer = tokenizer
         self.teacher_model = teacher_model
         self.data_collator = data_collator or SDFTDataCollator(tokenizer)
+        self.vllm_engine = vllm_engine
 
         # Track steps for teacher sync
         self.global_step = 0
@@ -281,17 +285,17 @@ class SDFTTrainerWrapper:
         base_trainer.compute_loss = lambda model, inputs, return_outputs=False, **kwargs: self.compute_loss(
             model, inputs, return_outputs
         )
-        
+
     def _sync_teacher_weights(self):
         """Copy student weights to teacher (for 2A: same model, synced)"""
         if self.args.teacher_model_name is not None:
             return  # Using external teacher, don't sync
         for t_param, s_param in zip(
-            self.teacher_model.parameters(), 
+            self.teacher_model.parameters(),
             self.base.model.parameters()
         ):
             t_param.data.copy_(s_param.data)
-            
+
     def _build_teacher_prompt(self, student_prompt: str) -> str:
         """Build a demonstration-conditioned teacher prompt by prepending few-shot examples.
 
@@ -308,7 +312,7 @@ class SDFTTrainerWrapper:
         demo_text = "\n\n".join(f"Example {i+1}:\nQ: {q}\nA: {a}" for i, (q, a) in enumerate(demos))
         return f"{demo_text}\n\nNow answer:\nQ: {student_prompt}\nA:"
 
-    def _update_demo_buffer(self, prompts: List[str], completions: List[str]) -> None:
+    def _update_demo_buffer(self, prompts: list[str], completions: list[str]) -> None:
         """Store prompt-completion pairs for future use as teacher demonstrations."""
         if self._demo_buffer_size <= 0:
             return
@@ -321,32 +325,24 @@ class SDFTTrainerWrapper:
 
     def _generate_completions_on_policy(
         self,
-        prompts: List[str],
+        prompts: list[str],
         use_teacher: bool = False
-    ) -> Tuple[List[str], List[torch.Tensor]]:
-        """
-        Generate completions using on-policy sampling.
+    ) -> tuple[list[str], list[torch.Tensor]]:
+        """Generate completions using on-policy sampling.
         Returns (completions_text, completion_ids) where completion_ids are token ID tensors.
         """
         model = self.teacher_model if use_teacher else self.base.model
 
-        # --- vLLM path (returns text only, IDs reconstructed) ---
-        try:
-            from llamafactory.chat.vllm_engine import VLLMEngine
-            if self.args.use_vllm_for_generation and hasattr(self.base, 'vllm_engine'):
-                completions_text = self.base.vllm_engine.generate(
-                    prompts,
-                    max_new_tokens=self.args.max_new_tokens,
-                    temperature=self.args.temperature,
-                    top_p=self.args.top_p,
-                    n=self.args.num_generations
-                )
-                # Tokenize generated text to get IDs
-                completion_ids = [self.tokenizer.encode(c, add_special_tokens=False, return_tensors="pt")[0]
-                                  for c in completions_text]
+        # --- vLLM path (synchronous LLM, configured at training start) ---
+        if self.args.use_vllm_for_generation and self.vllm_engine is not None and self.vllm_engine.is_initialized:
+            completions_text = self.vllm_engine.generate(prompts)
+            if completions_text is not None:
+                # Tokenize generated text back to IDs for the forward pass
+                completion_ids = [
+                    self.tokenizer.encode(c, add_special_tokens=False, return_tensors="pt")[0]
+                    for c in completions_text
+                ]
                 return completions_text, completion_ids
-        except ImportError:
-            pass
 
         # --- Fallback: transformers generate ---
         tokenizer_inputs = self.tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
@@ -372,15 +368,16 @@ class SDFTTrainerWrapper:
                 completion_ids.append(gen_ids)
 
         return completions_text, completion_ids
-        
+
     def compute_loss(
         self,
         model,
-        inputs: Dict[str, torch.Tensor],
+        inputs: dict[str, torch.Tensor],
         return_outputs: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict]]:
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, dict]]:
         """SDFT loss: KL(student||teacher) between full vocabulary distributions
-        on on-policy generated completions, with demonstration-conditioned teacher."""
+        on on-policy generated completions, with demonstration-conditioned teacher.
+        """
         self.global_step += 1
 
         # 1. Decode student prompts and generate completions on-policy
@@ -489,7 +486,7 @@ class SDFTTrainerWrapper:
         if return_outputs:
             return total_loss, {"kl_loss": kl_loss.detach(), "total_loss": total_loss.detach()}
         return total_loss
-        
+
     def restore(self):
         """Unpatch the base trainer (cleanup)"""
         self.base.compute_loss = self._original_compute_loss
@@ -499,12 +496,11 @@ class SDFTTrainerWrapper:
 # 5. Registration Hook (call this to activate SDFT in LlamaFactory)
 # =============================================================================
 def register_sdft(
-    trainer_class=None, 
+    trainer_class=None,
     config_class=None,
     enable_logging: bool = True
 ):
-    """
-    Register SDFT plugin with LlamaFactory.
+    """Register SDFT plugin with LlamaFactory.
     
     Usage in your training script:
     ```
@@ -520,17 +516,17 @@ def register_sdft(
     """
     if enable_logging:
         logger.info("🔌 SDFT plugin registered. Use stage='sdft' in config to enable.")
-    
+
     # Optional: Auto-patch LlamaFactory's trainer factory if classes provided
     if trainer_class and config_class:
         # This is where you'd inject SDFTArguments into FinetuningArguments
         # and add stage handler to get_trainer() - left as exercise for repo integration
         logger.warning("Auto-patching not implemented in single-file mode. "
                       "See LlamaFactory docs for extending trainer factory.")
-    
+
     return {
         "SDFTArguments": SDFTArguments,
-        "SDFTDataCollator": SDFTDataCollator, 
+        "SDFTDataCollator": SDFTDataCollator,
         "SDFTTrainerWrapper": SDFTTrainerWrapper,
         "compute_kl_divergence": compute_kl_divergence
     }

@@ -19,6 +19,7 @@ from ...extras.logging import get_logger
 from ...extras.misc import calculate_tps
 from ...extras.ploting import plot_loss
 from ...model import load_model, load_tokenizer
+from ...train.sdft.vllm_engine import SDFTVLLMEngine
 from ...train.sdft_plugin import SDFTArguments, SDFTDataCollator, SDFTTrainerWrapper
 from ..sft.trainer import CustomSeq2SeqTrainer
 from ..trainer_utils import create_modelcard_and_push
@@ -83,6 +84,20 @@ def run_sdft(
         use_vllm_for_generation=finetuning_args.use_vllm_for_generation,
     )
 
+    # Initialize vLLM engine for fast on-policy generation
+    vllm_engine = None
+    if finetuning_args.use_vllm_for_generation:
+        vllm_engine = SDFTVLLMEngine(
+            model=model,
+            tokenizer=tokenizer,
+            model_name_or_path=model_args.model_name_or_path,
+            cutoff_len=data_args.cutoff_len,
+            max_new_tokens=generating_args.max_new_tokens,
+            temperature=generating_args.temperature,
+            top_p=generating_args.top_p,
+            gpu_memory_utilization=getattr(finetuning_args, "vllm_gpu_memory_utilization", 0.85),
+        )
+
     # SDFT data collator (produces student/teacher input batches)
     data_collator = SDFTDataCollator(tokenizer, max_length=data_args.cutoff_len)
 
@@ -107,39 +122,43 @@ def run_sdft(
         teacher_model=teacher_model,
         tokenizer=tokenizer,
         data_collator=data_collator,
+        vllm_engine=vllm_engine,
     )
 
-    # Training (runs through base_trainer with SDFT-patched compute_loss)
-    if training_args.do_train:
-        train_result = base_trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
-        base_trainer.save_model()
-        if finetuning_args.include_effective_tokens_per_second:
-            train_result.metrics["effective_tokens_per_sec"] = calculate_tps(
-                dataset_module["train_dataset"], train_result.metrics, stage="sdft"
-            )
-
-        base_trainer.log_metrics("train", train_result.metrics)
-        base_trainer.save_metrics("train", train_result.metrics)
-        base_trainer.save_state()
-        if base_trainer.is_world_process_zero() and finetuning_args.plot_loss:
-            keys = ["loss"]
-            if isinstance(dataset_module.get("eval_dataset"), dict):
-                keys += sum(
-                    [[f"eval_{key}_loss", f"eval_{key}_accuracy"] for key in dataset_module["eval_dataset"].keys()], []
+    try:
+        # Training (runs through base_trainer with SDFT-patched compute_loss)
+        if training_args.do_train:
+            train_result = base_trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+            base_trainer.save_model()
+            if finetuning_args.include_effective_tokens_per_second:
+                train_result.metrics["effective_tokens_per_sec"] = calculate_tps(
+                    dataset_module["train_dataset"], train_result.metrics, stage="sdft"
                 )
-            else:
-                keys += ["eval_loss", "eval_accuracy"]
 
-            plot_loss(training_args.output_dir, keys=keys)
+            base_trainer.log_metrics("train", train_result.metrics)
+            base_trainer.save_metrics("train", train_result.metrics)
+            base_trainer.save_state()
+            if base_trainer.is_world_process_zero() and finetuning_args.plot_loss:
+                keys = ["loss"]
+                if isinstance(dataset_module.get("eval_dataset"), dict):
+                    keys += sum(
+                        [[f"eval_{key}_loss", f"eval_{key}_accuracy"] for key in dataset_module["eval_dataset"].keys()], []
+                    )
+                else:
+                    keys += ["eval_loss", "eval_accuracy"]
 
-    # Evaluation
-    if training_args.do_eval:
-        metrics = base_trainer.evaluate(metric_key_prefix="eval")
-        base_trainer.log_metrics("eval", metrics)
-        base_trainer.save_metrics("eval", metrics)
+                plot_loss(training_args.output_dir, keys=keys)
 
-    # Cleanup: un-patch base trainer
-    sdft_trainer.restore()
+        # Evaluation
+        if training_args.do_eval:
+            metrics = base_trainer.evaluate(metric_key_prefix="eval")
+            base_trainer.log_metrics("eval", metrics)
+            base_trainer.save_metrics("eval", metrics)
+    finally:
+        # Cleanup
+        sdft_trainer.restore()
+        if vllm_engine is not None:
+            vllm_engine.shutdown()
 
     # Create model card
     create_modelcard_and_push(base_trainer, model_args, data_args, training_args, finetuning_args)
