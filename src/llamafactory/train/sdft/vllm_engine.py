@@ -14,7 +14,6 @@
 
 import atexit
 import gc
-import json
 import os
 import signal
 import tempfile
@@ -30,19 +29,16 @@ if TYPE_CHECKING:
 class SDFTVLLMEngine:
     """Wraps vLLM's synchronous LLM for fast on-policy generation during SDFT training.
 
-    Replaces the slow ``model.generate()`` fallback with vLLM's PagedAttention-based
-    batch generation (10-50x faster for long completions).
+    Instead of merging LoRA weights and saving a full model copy (~9GB), we save
+    only the LoRA adapter (<50MB) and point vLLM at the original model path with
+    ``enable_lora=True`` + ``LoRARequest``. vLLM applies the adapter on-the-fly,
+    eliminating disk I/O, serialization issues, and ``/tmp`` quota problems.
 
-    **Weight sync strategy (Phase 1)**:
-        The engine is created once at training start from the initial merged LoRA
-        weights. Generation is slightly off-policy as training progresses, but the
-        demonstration buffer provides the primary KL signal. Full periodic weight
-        sync is planned for Phase 2.
+    Usage::
 
-    **Model compatibility**:
-        Downloads auxiliary config files (preprocessor, tokenizer, etc.) from the
-        original HF model repo so vLLM's loader finds everything it expects. Works
-        with any model architecture — text-only, vision-language, audio, etc.
+        engine = SDFTVLLMEngine(model, tokenizer, model_name_or_path, cutoff_len, max_new_tokens)
+        completions = engine.generate(prompts)
+        engine.shutdown()
     """
 
     def __init__(
@@ -58,67 +54,72 @@ class SDFTVLLMEngine:
         tensor_parallel_size: int = 1,
         disable_multimodal: bool = True,
     ):
-        """Initialize vLLM engine from the current (possibly LoRA-adapted) model weights.
+        """Initialize vLLM engine using native LoRA support.
 
         Args:
-            model: The training model (may be a PeftModel with LoRA adapters).
+            model: The training PeftModel with LoRA adapters.
             tokenizer: Tokenizer matching the model.
-            model_name_or_path: Original HF model ID or path used to fetch
-                auxiliary config files (preprocessor, tokenizer, etc.).
+            model_name_or_path: Original HF model ID or path (loaded by vLLM from cache).
             cutoff_len: Maximum prompt token length.
             max_new_tokens: Maximum tokens to generate per completion.
             temperature: Sampling temperature.
             top_p: Nucleus sampling threshold.
             gpu_memory_utilization: Fraction of GPU memory for vLLM (0.0-1.0).
             tensor_parallel_size: Number of GPUs for tensor parallelism.
-            disable_multimodal: If True, force text-only mode even for multi-modal
-                architectures (Qwen3, etc.). Set False for vision/audio datasets.
+            disable_multimodal: If True, force text-only mode.
         """
         self._llm = None
         self._initialized = False
-        self._temp_dir: Optional[str] = None
+        self._lora_dir: Optional[str] = None
 
         # Check vLLM availability
         try:
             from vllm import LLM, SamplingParams
+            from vllm.lora.request import LoRARequest
 
             self._LLM = LLM
             self._SamplingParams = SamplingParams
+            self._LoRARequest = LoRARequest
         except ImportError:
             print("SDFTVLLMEngine: vLLM not installed, falling back to model.generate().")
             return
 
-        # Build a complete model directory that vLLM can load
-        self._temp_dir = tempfile.mkdtemp(prefix="sdft_vllm_")
+        # Determine if we have a LoRA model
+        has_lora = hasattr(model, "peft_config") and model.peft_config is not None
+        base_model_path = model_name_or_path
 
-        # Phase 1: pull auxiliary config files from original HF repo
-        _download_auxiliary_configs(model_name_or_path, self._temp_dir, disable_multimodal=disable_multimodal)
+        # If LoRA: save adapter to temp dir, load base model in vLLM with LoRA
+        if has_lora and hasattr(model, "save_pretrained"):
+            self._lora_dir = tempfile.mkdtemp(prefix="sdft_lora_")
+            try:
+                model.save_pretrained(self._lora_dir)
+                self._lora_request = self._LoRARequest("sdft", 1, self._lora_dir)
+            except Exception as e:
+                print(f"SDFTVLLMEngine: Failed to save LoRA adapter: {e}")
+                self._lora_dir = None
+                self._lora_request = None
+        else:
+            self._lora_request = None
 
-        # Phase 2: save merged weights + model config
+        # Build and initialize vLLM engine pointing at the ORIGINAL model
         try:
-            self._save_merged_weights(model, self._temp_dir)
-        except Exception as e:
-            print(f"SDFTVLLMEngine: Failed to save merged model weights: {e}")
-            return
+            engine_kwargs = {
+                "model": base_model_path,
+                "trust_remote_code": True,
+                "dtype": "auto",
+                "max_model_len": cutoff_len + max_new_tokens,
+                "gpu_memory_utilization": gpu_memory_utilization,
+                "tensor_parallel_size": tensor_parallel_size,
+                "disable_log_stats": True,
+                "enable_lora": self._lora_request is not None,
+                "max_lora_rank": 64,
+            }
 
-        # Phase 2b: if text-only mode, strip multi-modal configs that trigger vLLM
-        # processor loading (image/video processor deprecation warnings + extra memory)
-        if disable_multimodal:
-            _strip_multimodal_config(self._temp_dir)
+            # In text-only mode, skip multi-modal processor loading
+            if disable_multimodal:
+                engine_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0, "audio": 0}
 
-        # Build and initialize vLLM engine
-        try:
-            self._llm = self._LLM(
-                model=self._temp_dir,
-                trust_remote_code=True,
-                dtype="auto",
-                max_model_len=cutoff_len + max_new_tokens,
-                gpu_memory_utilization=gpu_memory_utilization,
-                tensor_parallel_size=tensor_parallel_size,
-                disable_log_stats=True,
-                enable_lora=False,
-                enforce_eager=True,  # skip CUDA graph capture for faster init
-            )
+            self._llm = self._LLM(**engine_kwargs)
 
             self._sampling_params = self._SamplingParams(
                 temperature=temperature,
@@ -148,13 +149,14 @@ class SDFTVLLMEngine:
             prompts: List of prompt strings to complete.
 
         Returns:
-            List of completion strings, or None if engine is not initialized
-            (caller should fall back to ``model.generate()``).
+            List of completion strings, or None if engine is not initialized.
         """
         if not self.is_initialized:
             return None
 
-        results = self._llm.generate(prompts, self._sampling_params)
+        results = self._llm.generate(
+            prompts, self._sampling_params, lora_request=self._lora_request
+        )
         return [result.outputs[0].text for result in results]
 
     def shutdown(self) -> None:
@@ -168,14 +170,14 @@ class SDFTVLLMEngine:
 
         self._initialized = False
 
-        if self._temp_dir and os.path.isdir(self._temp_dir):
+        if self._lora_dir and os.path.isdir(self._lora_dir):
             import shutil
 
-            shutil.rmtree(self._temp_dir, ignore_errors=True)
-            self._temp_dir = None
+            shutil.rmtree(self._lora_dir, ignore_errors=True)
+            self._lora_dir = None
 
     def _signal_handler(self, signum, frame):
-        """Handle SIGINT/SIGTERM: clean up vLLM workers then re-raise."""
+        """Handle SIGINT/SIGTERM: clean up then re-raise."""
         self.shutdown()
         self._force_kill_workers()
         raise KeyboardInterrupt
@@ -191,7 +193,6 @@ class SDFTVLLMEngine:
         import subprocess
 
         try:
-            # Kill vLLM worker processes spawned during this session
             subprocess.run(
                 ["pkill", "-f", "vllm.*EngineCore"],
                 capture_output=True,
@@ -199,169 +200,3 @@ class SDFTVLLMEngine:
             )
         except Exception:
             pass
-
-    @staticmethod
-    def _save_merged_weights(model, save_dir: str) -> None:
-        """Merge LoRA adapters into base weights and save full model to disk.
-
-        Uses ``merge_adapter()`` / ``unmerge_adapter()`` to temporarily merge
-        LoRA without destroying the PeftModel wrapper, preserving the training
-        state for continued fine-tuning.
-
-        The merged weights are saved as ``model.safetensors`` alongside the
-        model config (``config.json``). vLLM loads safetensors natively.
-        """
-        has_lora = hasattr(model, "peft_config") and model.peft_config
-
-        if has_lora:
-            # Temporarily merge LoRA into base weights
-            model.merge_adapter()
-
-            # Access the underlying transformers model
-            if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
-                underlying = model.base_model.model
-            else:
-                underlying = model
-
-            # Save merged weights as safetensors (vLLM native, handles complex
-            # state_dicts with vision components, shared tensors, etc.)
-            underlying.save_pretrained(save_dir, safe_serialization=True)
-
-            # Restore LoRA training state
-            model.unmerge_adapter()
-        else:
-            # No adapter: full fine-tune or frozen — save as safetensors
-            if hasattr(model, "save_pretrained"):
-                model.save_pretrained(save_dir, safe_serialization=True)
-            else:
-                from safetensors.torch import save_file
-
-                save_file(model.state_dict(), os.path.join(save_dir, "model.safetensors"))
-                if hasattr(model, "config"):
-                    model.config.save_pretrained(save_dir)
-
-
-def _download_auxiliary_configs(model_name_or_path: str, save_dir: str, disable_multimodal: bool = True) -> None:
-    """Download non-weight config files from the original HF model repo.
-
-    vLLM's model loader expects a complete model directory with all auxiliary
-    config files (preprocessor_config.json, tokenizer_config.json,
-    chat_template.jinja, etc.). This downloads those files from the original
-    source so vLLM finds everything it needs regardless of architecture.
-
-    When ``disable_multimodal=True`` (default), skips the HF download entirely
-    and writes a text-only stub preprocessor config. This forces vLLM to treat
-    even multi-modal models as text-only, avoiding image/video processor
-    loading errors when the dataset doesn't need multi-modal outputs.
-
-    Args:
-        model_name_or_path: HF model ID or local path.
-        save_dir: Directory to save config files into.
-        disable_multimodal: If True, force text-only mode (skip multi-modal
-            processor loading).
-    """
-    # Route 1: Text-only forced mode — write stub, skip HF download
-    if disable_multimodal:
-        _write_stub_preprocessor_config(save_dir)
-        return
-
-    # Route 2: Full multi-modal — download real configs from HF hub
-    is_hf_hub = not os.path.isdir(model_name_or_path) and "/" in model_name_or_path
-    if not is_hf_hub:
-        _write_stub_preprocessor_config(save_dir)
-        return
-
-    try:
-        from huggingface_hub import list_repo_files, snapshot_download
-
-        # List all files in the repo
-        repo_files = list_repo_files(model_name_or_path)
-
-        # Filter to config-only files (skip weight files)
-        weight_extensions = (".safetensors", ".bin", ".pt", ".h5", ".msgpack", ".ot", ".ckpt")
-        config_files = [
-            f for f in repo_files
-            if not any(f.endswith(ext) for ext in weight_extensions)
-            and not f.startswith(".")
-        ]
-
-        # Download config files to the temp directory
-        snapshot_download(
-            repo_id=model_name_or_path,
-            local_dir=save_dir,
-            allow_patterns=config_files,
-            local_dir_use_symlinks=False,
-        )
-    except Exception:
-        # Network unavailable or invalid repo — write a stub that works
-        # for text-only models; multi-modal models will fail gracefully
-        _write_stub_preprocessor_config(save_dir)
-
-
-def _write_stub_preprocessor_config(save_dir: str) -> None:
-    """Write a stub preprocessor config for text-only models.
-
-    Some architectures (e.g., Qwen3) trigger vLLM's multi-modal processor
-    loader even for text-only variants. This stub tells vLLM there is no
-    image/video processor, allowing text-only generation to proceed.
-    Multi-modal models will get their real preprocessor config from the
-    HF hub download path above.
-    """
-    preprocessor_path = os.path.join(save_dir, "preprocessor_config.json")
-    if not os.path.exists(preprocessor_path):
-        with open(preprocessor_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "image_processor_type": None,
-                    "feature_extractor_type": None,
-                    "processor_class": "AutoProcessor",
-                },
-                f,
-            )
-
-
-def _strip_multimodal_config(save_dir: str) -> None:
-    """Remove multi-modal fields from saved config files.
-
-    vLLM v0.20 inspects config.json for processor hints even when
-    preprocessor_config.json says text-only. This removes vision/audio
-    processor references from the saved config so vLLM doesn't try to
-    load unnecessary processors.
-    """
-    config_path = os.path.join(save_dir, "config.json")
-    if not os.path.exists(config_path):
-        return
-
-    with open(config_path, encoding="utf-8") as f:
-        config = json.load(f)
-
-    # Remove fields that trigger multi-modal processor loading
-    mm_fields = [
-        "image_processor_type",
-        "video_processor_type",
-        "audio_processor_type",
-        "processor_class",
-        "vision_config",
-        "mm_hidden_size",
-        "mm_vision_tower",
-        "mm_audio_tower",
-        "mm_projector_type",
-        "image_token_id",
-        "video_token_id",
-        "audio_token_id",
-    ]
-    for field in mm_fields:
-        config.pop(field, None)
-
-    # Also remove deprecated image_processor_type from preprocessor
-    preprocessor_path = os.path.join(save_dir, "preprocessor_config.json")
-    if os.path.exists(preprocessor_path):
-        with open(preprocessor_path, encoding="utf-8") as f:
-            pp_config = json.load(f)
-        pp_config["image_processor_type"] = None
-        pp_config["feature_extractor_type"] = None
-        with open(preprocessor_path, "w", encoding="utf-8") as f:
-            json.dump(pp_config, f, indent=2)
-
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
