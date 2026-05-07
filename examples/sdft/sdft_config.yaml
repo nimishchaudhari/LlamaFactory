@@ -1,51 +1,138 @@
-### model (REQUIRED - this was missing)
-model_name_or_path: Qwen/Qwen3.5-4B  # ← ADD THIS LINE
-template: qwen3
-finetuning_type: lora
+# =============================================================================
+# SDFT (Self-Distillation Fine-Tuning) — Example Configuration
+# =============================================================================
+#
+# SDFT trains a student model by minimizing KL divergence against a
+# demonstration-conditioned teacher. The teacher sees few-shot examples;
+# the student doesn't. This produces on-policy regularization that reduces
+# catastrophic forgetting while acquiring new skills.
+#
+# Quick start:
+#   CUDA_VISIBLE_DEVICES=0 llmf train examples/sdft/sdft_config.yaml
+#
+# For best results with SDFT, use a 7B+ model (stronger in-context learning)
+# and real datasets (not identity). The identity dataset here is for
+# verifying the training loop runs correctly.
+# =============================================================================
 
-### method
-stage: sdft  # ← Switch from 'sft' to 'sdft'
+
+# ---------------------------------------------------------------------------
+# MODEL — which base model to fine-tune
+# ---------------------------------------------------------------------------
+model_name_or_path: Qwen/Qwen3.5-4B   # HF model ID or local path
+template: qwen3                        # chat template (must match model family)
+finetuning_type: lora                  # lora | full | freeze
+
+
+# ---------------------------------------------------------------------------
+# TRAINING STAGE — must be "sdft" to activate this path
+# ---------------------------------------------------------------------------
+stage: sdft
 do_train: true
 
-### SDFT-specific params (new)
-alpha: 0.0           # Forward KL
-beta: 0.01           # Small regularization to base model
+
+# ---------------------------------------------------------------------------
+# SDFT LOSS PARAMETERS — controls the distillation signal
+# ---------------------------------------------------------------------------
+alpha: 0.0
+  # KL divergence type:
+  #   0.0 = forward KL  (student || teacher) — mode-seeking, default
+  #   1.0 = reverse KL  (teacher || student) — mean-seeking
+  #   0.x = Jensen-Shannon (mixture of both)
+
+beta: 0.01
+  # KL regularization toward the FROZEN initial model (prevents drift).
+  # Set to 0.0 to disable. Requires a ref_model to be set up in the trainer.
+
 num_loss_tokens_to_skip: 3
+  # Skip the first N completion tokens in the loss. The first few tokens
+  # of a generated response are often low-quality or template artifacts.
+
 top_entropy_quantile: 0.8
-teacher_model_name: null      # null = sync from student (2A)
+  # Only apply loss to the 20% most uncertain tokens (1.0 = all tokens).
+  # Higher values (closer to 1.0) keep more tokens; 0.8 is a good default.
+
+num_demonstrations: 2
+  # Number of few-shot examples prepended to the teacher prompt.
+  # These examples are drawn from a ring buffer of past training pairs.
+  #   0 = teacher sees the same prompt as the student (loss will be 0!)
+  #   1-4 = typical range; more demos improve teacher conditioning but
+  #         consume context window space
+
+
+# ---------------------------------------------------------------------------
+# TEACHER MODEL — what model conditions the distillation signal
+# ---------------------------------------------------------------------------
+teacher_model_name: null
+  # Path or HF ID of a separate teacher model. Options:
+  #   null / "" = use the SAME model as both student and teacher
+  #               (relies on demonstration-conditioning for KL signal)
+  #   "Qwen/Qwen3.5-8B" = use a stronger static teacher (no demo buffer
+  #                        needed; KL comes from capacity difference)
+
 sync_teacher_every: 1
+  # When teacher_model_name is null (shared weights), copy student weights
+  # to teacher every N steps. 1 = every step, 0 = never (teacher frozen).
+
+
+# ---------------------------------------------------------------------------
+# ON-POLICY GENERATION — sampling completions from the student
+# ---------------------------------------------------------------------------
+temperature: 1.0     # sampling temperature (higher = more diverse)
+top_p: 1.0           # nucleus sampling threshold (1.0 = disabled)
+num_generations: 1   # completions to sample per prompt
+max_new_tokens: 512  # max tokens to generate per completion
+
 use_vllm_for_generation: true
-
-### generation (for on-policy sampling)
-temperature: 1.0
-top_p: 1.0
-num_generations: 1
-max_new_tokens: 512  # Keep small for testing
+  # Whether to use vLLM for faster generation. Currently a no-op —
+  # falls back to model.generate(). Full vLLM integration is planned.
 
 
-### dataset
-dataset: identity  # ← Use a tiny built-in dataset for testing
-cutoff_len: 2048
-max_samples: 100
+# ---------------------------------------------------------------------------
+# DATASET — what data to train on
+# ---------------------------------------------------------------------------
+dataset: identity
+  # Built-in tiny dataset for testing the training loop. Replace with
+  # real data for meaningful results, e.g.:
+  #   dataset: alpaca_en, identity
+  #   dataset: your_custom_dataset_name
+
+cutoff_len: 2048         # max sequence length after tokenization
+max_samples: 100         # limit total samples (remove for full dataset)
 preprocessing_num_workers: 2
 
-### output
+
+# ---------------------------------------------------------------------------
+# OUTPUT — where checkpoints and logs are saved
+# ---------------------------------------------------------------------------
 output_dir: saves/sdft-test
-logging_steps: 1
-save_steps: 10
+logging_steps: 1          # log metrics every N steps
+save_steps: 10            # save checkpoint every N steps
 overwrite_output_dir: true
 
-### lora
-lora_rank: 8
-lora_alpha: 16
-lora_target: all
 
-### training
-per_device_train_batch_size: 1       # Reduced from 2 — SDFT needs 2 forward passes per step
-gradient_accumulation_steps: 1       # Reduced from 2
+# ---------------------------------------------------------------------------
+# LoRA CONFIGURATION — adapter hyperparameters
+# ---------------------------------------------------------------------------
+lora_rank: 16
+lora_alpha: 32
+lora_target: all           # apply LoRA to all linear layers
+
+
+# ---------------------------------------------------------------------------
+# TRAINING HYPERPARAMETERS
+# ---------------------------------------------------------------------------
+per_device_train_batch_size: 1
+  # SDFT does 2 forward passes (student + teacher) + on-policy generation
+  # per step. Keep batch size at 1 to stay within GPU memory.
+
+gradient_accumulation_steps: 1
+  # Effective batch size = per_device_batch × grad_accum × num_gpus.
+  # Increase grad_accum to simulate larger batches without OOM.
+
 learning_rate: 1.0e-4
-num_train_epochs: 0.1
+num_train_epochs: 0.1      # 0.1 = quick test; use 1-3 for real training
 lr_scheduler_type: cosine
 warmup_ratio: 0.1
-bf16: true
-ddp_timeout: 180000000
+bf16: true                 # use bfloat16 mixed precision (requires Ampere+ GPU)
+ddp_timeout: 180000000     # generous timeout for distributed setup
