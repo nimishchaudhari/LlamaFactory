@@ -65,26 +65,26 @@ Config requirements: `cutoff_len=1024-2048`, `max_new_tokens=128-256`,
 ### Phase 1 (MVP) — Basic sync LLM integration
 
 - [x] Plan documented in this file
-- [ ] **1.1** `SDFTVLLMEngine` class — `src/llamafactory/train/sdft/vllm_engine.py`
-  - [ ] 1.1a: `__init__()` — loads vLLM `LLM` from model path, configures `SamplingParams`
-  - [ ] 1.1b: `generate(prompts: list[str]) -> list[str]` — synchronous batch generation
-  - [ ] 1.1c: `sync_weights(model)` — merge LoRA → save to tmpdir → recreate LLM
-  - [ ] 1.1d: `shutdown()` — delete LLM, free GPU memory
-  - [ ] 1.1e: Apache 2.0 license header
-- [ ] **1.2** Wire vLLM path into `_generate_completions_on_policy()`
-  - [ ] 1.2a: Replace dead code (lines 334-349) with real `self.vllm_engine.generate()`
-  - [ ] 1.2b: Pass `SamplingParams` matching `temperature`, `top_p`, `max_new_tokens` from config
-  - [ ] 1.2c: Tokenize generated text → token IDs (preserve current return format)
-  - [ ] 1.2d: Graceful fallback to `model.generate()` if engine not initialized
-- [ ] **1.3** Wire into `sdft/workflow.py` (`run_sdft()`)
-  - [ ] 1.3a: Import `SDFTVLLMEngine`
-  - [ ] 1.3b: Create engine after model load: `vllm_engine = SDFTVLLMEngine(model, tokenizer, model_args, sdft_args)`
-  - [ ] 1.3c: Pass engine to `SDFTTrainerWrapper(vllm_engine=vllm_engine, ...)`
-  - [ ] 1.3d: Call `vllm_engine.shutdown()` in finally/cleanup
-- [ ] **1.4** Config additions — `src/llamafactory/hparams/finetuning_args.py`
-  - [ ] 1.4a: Add `vllm_sync_every: int = 32` field
-  - [ ] 1.4b: Add `vllm_gpu_memory_utilization: float = 0.85` field
-- [ ] **1.5** `SDFTDataCollator` — (unchanged, verify compatibility)
+- [x] **1.1** `SDFTVLLMEngine` class — `src/llamafactory/train/sdft/vllm_engine.py`
+  - [x] 1.1a: `__init__()` — loads vLLM `LLM` from merged weights, configures `SamplingParams`
+  - [x] 1.1b: `generate(prompts: list[str]) -> list[str]` — synchronous batch generation
+  - [x] 1.1c: `_save_merged_weights()` — merge LoRA → save to tmpdir → unmerge (preserves training state)
+  - [x] 1.1d: `shutdown()` — delete LLM, free GPU memory, remove temp dir
+  - [x] 1.1e: Apache 2.0 license header
+- [x] **1.2** Wire vLLM path into `_generate_completions_on_policy()`
+  - [x] 1.2a: Replace dead code (lines 334-349) with real `self.vllm_engine.generate()`
+  - [x] 1.2b: Pass `SamplingParams` matching `temperature`, `top_p`, `max_new_tokens` from config
+  - [x] 1.2c: Tokenize generated text → token IDs (preserve current return format)
+  - [x] 1.2d: Graceful fallback to `model.generate()` if engine not initialized
+- [x] **1.3** Wire into `sdft/workflow.py` (`run_sdft()`)
+  - [x] 1.3a: Import `SDFTVLLMEngine`
+  - [x] 1.3b: Create engine after model load
+  - [x] 1.3c: Pass engine to `SDFTTrainerWrapper(vllm_engine=vllm_engine, ...)`
+  - [x] 1.3d: Call `vllm_engine.shutdown()` in try/finally
+- [x] **1.4** Config additions — `src/llamafactory/hparams/finetuning_args.py`
+  - [x] 1.4a: Add `vllm_sync_every: int = 32` field
+  - [x] 1.4b: Add `vllm_gpu_memory_utilization: float = 0.85` field
+- [x] **1.5** `SDFTDataCollator` — unchanged, verified compatibility
 - [ ] **1.6** Verify with Qwen3.5-4B + identity dataset
 
 ### Phase 2 (Optimize) — Memory and speed tuning
