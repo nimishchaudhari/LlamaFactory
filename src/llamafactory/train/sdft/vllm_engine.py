@@ -99,6 +99,11 @@ class SDFTVLLMEngine:
             print(f"SDFTVLLMEngine: Failed to save merged model weights: {e}")
             return
 
+        # Phase 2b: if text-only mode, strip multi-modal configs that trigger vLLM
+        # processor loading (image/video processor deprecation warnings + extra memory)
+        if disable_multimodal:
+            _strip_multimodal_config(self._temp_dir)
+
         # Build and initialize vLLM engine
         try:
             self._llm = self._LLM(
@@ -110,6 +115,7 @@ class SDFTVLLMEngine:
                 tensor_parallel_size=tensor_parallel_size,
                 disable_log_stats=True,
                 enable_lora=False,
+                enforce_eager=True,  # skip CUDA graph capture for faster init
             )
 
             self._sampling_params = self._SamplingParams(
@@ -278,3 +284,50 @@ def _write_stub_preprocessor_config(save_dir: str) -> None:
                 },
                 f,
             )
+
+
+def _strip_multimodal_config(save_dir: str) -> None:
+    """Remove multi-modal fields from saved config files.
+
+    vLLM v0.20 inspects config.json for processor hints even when
+    preprocessor_config.json says text-only. This removes vision/audio
+    processor references from the saved config so vLLM doesn't try to
+    load unnecessary processors.
+    """
+    config_path = os.path.join(save_dir, "config.json")
+    if not os.path.exists(config_path):
+        return
+
+    with open(config_path, encoding="utf-8") as f:
+        config = json.load(f)
+
+    # Remove fields that trigger multi-modal processor loading
+    mm_fields = [
+        "image_processor_type",
+        "video_processor_type",
+        "audio_processor_type",
+        "processor_class",
+        "vision_config",
+        "mm_hidden_size",
+        "mm_vision_tower",
+        "mm_audio_tower",
+        "mm_projector_type",
+        "image_token_id",
+        "video_token_id",
+        "audio_token_id",
+    ]
+    for field in mm_fields:
+        config.pop(field, None)
+
+    # Also remove deprecated image_processor_type from preprocessor
+    preprocessor_path = os.path.join(save_dir, "preprocessor_config.json")
+    if os.path.exists(preprocessor_path):
+        with open(preprocessor_path, encoding="utf-8") as f:
+            pp_config = json.load(f)
+        pp_config["image_processor_type"] = None
+        pp_config["feature_extractor_type"] = None
+        with open(preprocessor_path, "w", encoding="utf-8") as f:
+            json.dump(pp_config, f, indent=2)
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
