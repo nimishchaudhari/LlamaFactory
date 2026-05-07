@@ -38,6 +38,7 @@ from .kto import run_kto
 from .ppo import run_ppo
 from .pt import run_pt
 from .rm import run_rm
+from .sdft import run_sdft
 from .sft import run_sft
 from .trainer_utils import (
     get_placement_group,
@@ -98,6 +99,8 @@ def _training_function(config: dict[str, Any]) -> None:
             from .mca import run_dpo as run_dpo_mca
 
             run_dpo_mca(model_args, data_args, training_args, finetuning_args, callbacks)
+    elif finetuning_args.stage == "sdft":
+        run_sdft(model_args, data_args, training_args, finetuning_args, generating_args, callbacks)
 
     elif finetuning_args.stage == "pt":
         run_pt(model_args, data_args, training_args, finetuning_args, callbacks)

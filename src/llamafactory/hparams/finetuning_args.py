@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 
 @dataclass
@@ -457,7 +457,7 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to train model in purely bf16 precision (without AMP)."},
     )
-    stage: Literal["pt", "sft", "rm", "ppo", "dpo", "kto"] = field(
+    stage: Literal["pt", "sft", "rm", "ppo", "dpo", "kto", "sdft"] = field(
         default="sft",
         metadata={"help": "Which stage will be performed in training."},
     )
@@ -465,6 +465,42 @@ class FinetuningArguments(
         default="lora",
         metadata={"help": "Which fine-tuning method to use."},
     )
+
+    # === SDFT Parameters ===
+    alpha: float = field(
+        default=0.0,
+        metadata={"help": "KL divergence type: 0=forward, 1=reverse, 0<x<1=JS"},
+    )
+    beta: float = field(
+        default=0.0,
+        metadata={"help": "KL coefficient w.r.t. base model"},
+    )
+    num_loss_tokens_to_skip: int = field(
+        default=3,
+        metadata={"help": "Skip first N tokens in loss"},
+    )
+    top_entropy_quantile: float = field(
+        default=1.0,
+        metadata={"help": "Only loss on top-quantile entropy tokens"},
+    )
+    teacher_model_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Teacher model path (None=sync from student)"},
+    )
+    sync_teacher_every: int = field(
+        default=1,
+        metadata={"help": "Sync teacher weights every N steps"},
+    )
+    num_generations: int = field(
+        default=1,
+        metadata={"help": "Completions to sample per prompt"},
+    )
+    use_vllm_for_generation: bool = field(
+        default=True,
+        metadata={"help": "Use vLLM for on-policy generation"},
+    )
+    # === END SDFT ===
+
     use_llama_pro: bool = field(
         default=False,
         metadata={"help": "Whether or not to make only the parameters in the expanded blocks trainable."},

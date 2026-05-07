@@ -1,0 +1,51 @@
+### model (REQUIRED - this was missing)
+model_name_or_path: Qwen/Qwen3.5-4B  # ← ADD THIS LINE
+template: qwen3
+finetuning_type: lora
+
+### method
+stage: sdft  # ← Switch from 'sft' to 'sdft'
+do_train: true
+
+### SDFT-specific params (new)
+alpha: 0.0           # Forward KL
+beta: 0.01           # Small regularization to base model
+num_loss_tokens_to_skip: 3
+top_entropy_quantile: 0.8
+teacher_model_name: null      # null = sync from student (2A)
+sync_teacher_every: 1
+use_vllm_for_generation: true
+
+### generation (for on-policy sampling)
+temperature: 1.0
+top_p: 1.0
+num_generations: 1
+max_new_tokens: 512  # Keep small for testing
+
+
+### dataset
+dataset: identity  # ← Use a tiny built-in dataset for testing
+cutoff_len: 2048
+max_samples: 100
+preprocessing_num_workers: 2
+
+### output
+output_dir: saves/sdft-test
+logging_steps: 1
+save_steps: 10
+overwrite_output_dir: true
+
+### lora
+lora_rank: 8
+lora_alpha: 16
+lora_target: all
+
+### training
+per_device_train_batch_size: 1       # Reduced from 2 — SDFT needs 2 forward passes per step
+gradient_accumulation_steps: 1       # Reduced from 2
+learning_rate: 1.0e-4
+num_train_epochs: 0.1
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
