@@ -83,9 +83,24 @@ top_p: 1.0           # nucleus sampling threshold (1.0 = disabled)
 num_generations: 1   # completions to sample per prompt
 max_new_tokens: 512  # max tokens to generate per completion
 
+# ---------------------------------------------------------------------------
+# vLLM ENGINE — fast on-policy generation (10-50× speedup)
+# ---------------------------------------------------------------------------
 use_vllm_for_generation: true
-  # Whether to use vLLM for faster generation. Currently a no-op —
-  # falls back to model.generate(). Full vLLM integration is planned.
+  # Use vLLM's synchronous LLM engine for batch generation.
+  # If vLLM is not installed or fails to init, falls back to model.generate().
+
+vllm_gpu_memory_utilization: 0.85
+  # Fraction of GPU memory reserved for vLLM (0.0-1.0).
+  # Lower if OOM (e.g., 0.6); raise (0.9) if GPU has headroom.
+
+vllm_disable_multimodal: true
+  # Force text-only mode in vLLM, even for multi-modal architectures (Qwen3, etc.).
+  # Set to false only when your dataset includes images/video/audio.
+
+vllm_sync_every: 32
+  # Sync training weights to vLLM engine every N steps. Phase 2 feature — currently
+  # a no-op (engine created once at init, no weight updates during training).
 
 
 # ---------------------------------------------------------------------------

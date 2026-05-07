@@ -57,6 +57,7 @@ class SDFTArguments:
     use_vllm_for_generation: bool = field(default=True, metadata={"help": "Use vLLM for faster on-policy generation"})
     vllm_sync_every: int = field(default=32, metadata={"help": "Sync training weights to vLLM every N steps (0=never)"})
     vllm_gpu_memory_utilization: float = field(default=0.85, metadata={"help": "GPU memory fraction for vLLM"})
+    vllm_disable_multimodal: bool = field(default=True, metadata={"help": "Force text-only vLLM mode (skips multi-modal processor loading)"})
 
     # Demonstration buffer for teacher-conditioning
     num_demonstrations: int = field(default=2, metadata={"help": "Number of few-shot demos to prepend to teacher prompt"})

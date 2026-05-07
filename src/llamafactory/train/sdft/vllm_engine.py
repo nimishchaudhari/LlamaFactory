@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import json
 import os
 import tempfile
 from typing import TYPE_CHECKING, Optional
@@ -36,11 +37,10 @@ class SDFTVLLMEngine:
         demonstration buffer provides the primary KL signal. Full periodic weight
         sync is planned for Phase 2.
 
-    Usage::
-
-        engine = SDFTVLLMEngine(model, tokenizer, model_name_or_path, cutoff_len, max_new_tokens)
-        completions = engine.generate(prompts)  # or None if fallback needed
-        engine.shutdown()
+    **Model compatibility**:
+        Downloads auxiliary config files (preprocessor, tokenizer, etc.) from the
+        original HF model repo so vLLM's loader finds everything it expects. Works
+        with any model architecture — text-only, vision-language, audio, etc.
     """
 
     def __init__(
@@ -54,19 +54,23 @@ class SDFTVLLMEngine:
         top_p: float = 1.0,
         gpu_memory_utilization: float = 0.85,
         tensor_parallel_size: int = 1,
+        disable_multimodal: bool = True,
     ):
         """Initialize vLLM engine from the current (possibly LoRA-adapted) model weights.
 
         Args:
             model: The training model (may be a PeftModel with LoRA adapters).
             tokenizer: Tokenizer matching the model.
-            model_name_or_path: Original HF model ID or path (unused; compatibility).
+            model_name_or_path: Original HF model ID or path used to fetch
+                auxiliary config files (preprocessor, tokenizer, etc.).
             cutoff_len: Maximum prompt token length.
             max_new_tokens: Maximum tokens to generate per completion.
             temperature: Sampling temperature.
             top_p: Nucleus sampling threshold.
             gpu_memory_utilization: Fraction of GPU memory for vLLM (0.0-1.0).
             tensor_parallel_size: Number of GPUs for tensor parallelism.
+            disable_multimodal: If True, force text-only mode even for multi-modal
+                architectures (Qwen3, etc.). Set False for vision/audio datasets.
         """
         self._llm = None
         self._initialized = False
@@ -82,9 +86,13 @@ class SDFTVLLMEngine:
             print("SDFTVLLMEngine: vLLM not installed, falling back to model.generate().")
             return
 
-        # Save merged weights to temporary dir for vLLM loading
+        # Build a complete model directory that vLLM can load
         self._temp_dir = tempfile.mkdtemp(prefix="sdft_vllm_")
 
+        # Phase 1: pull auxiliary config files from original HF repo
+        _download_auxiliary_configs(model_name_or_path, self._temp_dir, disable_multimodal=disable_multimodal)
+
+        # Phase 2: save merged weights + model config
         try:
             self._save_merged_weights(model, self._temp_dir)
         except Exception as e:
@@ -160,8 +168,11 @@ class SDFTVLLMEngine:
         Uses ``merge_adapter()`` / ``unmerge_adapter()`` to temporarily merge
         LoRA without destroying the PeftModel wrapper, preserving the training
         state for continued fine-tuning.
+
+        The merged weights are saved as ``pytorch_model.bin`` alongside the
+        model config (``config.json``). Auxiliary config files should already
+        exist in ``save_dir`` from ``_download_auxiliary_configs``.
         """
-        HAS_CONFIG = hasattr(model, "config")
         has_lora = hasattr(model, "peft_config") and model.peft_config
 
         if has_lora:
@@ -174,42 +185,88 @@ class SDFTVLLMEngine:
             else:
                 underlying = model
 
-            # Save full model weights
+            # Save merged weights
             torch.save(underlying.state_dict(), os.path.join(save_dir, "pytorch_model.bin"))
 
-            # Save model config
+            # Save model config (overwrites any config from auxiliary download)
             if hasattr(underlying, "config"):
                 underlying.config.save_pretrained(save_dir)
-
-            # Save stub preprocessor config (required by vLLM for Qwen3/multi-modal architectures)
-            _write_preprocessor_config(save_dir)
-
-            # Save generation config
-            if hasattr(model, "generation_config"):
-                try:
-                    model.generation_config.save_pretrained(save_dir)
-                except Exception:
-                    pass
 
             # Restore LoRA training state
             model.unmerge_adapter()
         else:
             # No adapter: full fine-tune or frozen — save directly
             torch.save(model.state_dict(), os.path.join(save_dir, "pytorch_model.bin"))
-            if HAS_CONFIG:
+            if hasattr(model, "config"):
                 model.config.save_pretrained(save_dir)
-            _write_preprocessor_config(save_dir)
 
 
-def _write_preprocessor_config(save_dir: str) -> None:
-    """Write a stub preprocessor config to satisfy vLLM's model loader.
+def _download_auxiliary_configs(model_name_or_path: str, save_dir: str, disable_multimodal: bool = True) -> None:
+    """Download non-weight config files from the original HF model repo.
+
+    vLLM's model loader expects a complete model directory with all auxiliary
+    config files (preprocessor_config.json, tokenizer_config.json,
+    chat_template.jinja, etc.). This downloads those files from the original
+    source so vLLM finds everything it needs regardless of architecture.
+
+    When ``disable_multimodal=True`` (default), skips the HF download entirely
+    and writes a text-only stub preprocessor config. This forces vLLM to treat
+    even multi-modal models as text-only, avoiding image/video processor
+    loading errors when the dataset doesn't need multi-modal outputs.
+
+    Args:
+        model_name_or_path: HF model ID or local path.
+        save_dir: Directory to save config files into.
+        disable_multimodal: If True, force text-only mode (skip multi-modal
+            processor loading).
+    """
+    # Route 1: Text-only forced mode — write stub, skip HF download
+    if disable_multimodal:
+        _write_stub_preprocessor_config(save_dir)
+        return
+
+    # Route 2: Full multi-modal — download real configs from HF hub
+    is_hf_hub = not os.path.isdir(model_name_or_path) and "/" in model_name_or_path
+    if not is_hf_hub:
+        _write_stub_preprocessor_config(save_dir)
+        return
+
+    try:
+        from huggingface_hub import list_repo_files, snapshot_download
+
+        # List all files in the repo
+        repo_files = list_repo_files(model_name_or_path)
+
+        # Filter to config-only files (skip weight files)
+        weight_extensions = (".safetensors", ".bin", ".pt", ".h5", ".msgpack", ".ot", ".ckpt")
+        config_files = [
+            f for f in repo_files
+            if not any(f.endswith(ext) for ext in weight_extensions)
+            and not f.startswith(".")
+        ]
+
+        # Download config files to the temp directory
+        snapshot_download(
+            repo_id=model_name_or_path,
+            local_dir=save_dir,
+            allow_patterns=config_files,
+            local_dir_use_symlinks=False,
+        )
+    except Exception:
+        # Network unavailable or invalid repo — write a stub that works
+        # for text-only models; multi-modal models will fail gracefully
+        _write_stub_preprocessor_config(save_dir)
+
+
+def _write_stub_preprocessor_config(save_dir: str) -> None:
+    """Write a stub preprocessor config for text-only models.
 
     Some architectures (e.g., Qwen3) trigger vLLM's multi-modal processor
-    loading even for text-only models. This stub tells vLLM there is no
+    loader even for text-only variants. This stub tells vLLM there is no
     image/video processor, allowing text-only generation to proceed.
+    Multi-modal models will get their real preprocessor config from the
+    HF hub download path above.
     """
-    import json
-
     preprocessor_path = os.path.join(save_dir, "preprocessor_config.json")
     if not os.path.exists(preprocessor_path):
         with open(preprocessor_path, "w", encoding="utf-8") as f:

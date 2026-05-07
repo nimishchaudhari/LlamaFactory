@@ -125,13 +125,24 @@ num_generations: 1
   # Number of completions per prompt. More = better coverage.
   # Increase to 2-4 for richer KL signal (costs more GPU cycles).
 
-max_new_tokens: 512
+max_new_tokens: 128
   # Max tokens per completion. Tool calls are typically 50-200 tokens.
   # Reduce to 256 on 24GB GPUs, to 128 on tighter budgets.
 
 use_vllm_for_generation: true
-  # Note: currently a no-op (falls back to model.generate()).
-  # Full vLLM integration is planned for faster on-policy sampling.
+  # Use vLLM's synchronous LLM engine for batch generation.
+  # Keep true for single-GPU training (CUDA_VISIBLE_DEVICES=0).
+  # Falls back to model.generate() if vLLM not installed or in multi-GPU mode.
+
+vllm_gpu_memory_utilization: 0.85
+  # Fraction of GPU memory reserved for vLLM (0.0-1.0).
+  # Lower to 0.6 if OOM with 8B models.
+
+vllm_disable_multimodal: true
+  # Force text-only mode — tool calling datasets don't use images/video/audio.
+
+vllm_sync_every: 32
+  # Sync training weights to vLLM engine every N steps. Phase 2 — currently no-op.
 
 
 # ---------------------------------------------------------------------------

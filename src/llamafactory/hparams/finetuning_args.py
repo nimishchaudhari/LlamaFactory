@@ -511,6 +511,10 @@ class FinetuningArguments(
         default=0.85,
         metadata={"help": "Fraction of GPU memory reserved for vLLM engine (0.0-1.0)"},
     )
+    vllm_disable_multimodal: bool = field(
+        default=True,
+        metadata={"help": "Force text-only mode in vLLM even for multi-modal architectures"},
+    )
     # === END SDFT ===
 
     use_llama_pro: bool = field(

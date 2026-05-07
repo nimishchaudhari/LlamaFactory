@@ -82,21 +82,36 @@ def run_sdft(
         temperature=generating_args.temperature,
         top_p=generating_args.top_p,
         use_vllm_for_generation=finetuning_args.use_vllm_for_generation,
+        vllm_disable_multimodal=finetuning_args.vllm_disable_multimodal,
     )
 
-    # Initialize vLLM engine for fast on-policy generation
+    # Initialize vLLM engine for fast on-policy generation.
+    # vLLM only activates on single-GPU setups. With DDP (world_size > 1),
+    # we fall back to model.generate() — proper multi-GPU vLLM (tensor
+    # parallelism or broadcast) is planned for Phase 2.
     vllm_engine = None
     if finetuning_args.use_vllm_for_generation:
-        vllm_engine = SDFTVLLMEngine(
-            model=model,
-            tokenizer=tokenizer,
-            model_name_or_path=model_args.model_name_or_path,
-            cutoff_len=data_args.cutoff_len,
-            max_new_tokens=generating_args.max_new_tokens,
-            temperature=generating_args.temperature,
-            top_p=generating_args.top_p,
-            gpu_memory_utilization=getattr(finetuning_args, "vllm_gpu_memory_utilization", 0.85),
-        )
+        import torch.distributed as dist
+
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        if world_size == 1:
+            vllm_engine = SDFTVLLMEngine(
+                model=model,
+                tokenizer=tokenizer,
+                model_name_or_path=model_args.model_name_or_path,
+                cutoff_len=data_args.cutoff_len,
+                max_new_tokens=generating_args.max_new_tokens,
+                temperature=generating_args.temperature,
+                top_p=generating_args.top_p,
+                gpu_memory_utilization=getattr(finetuning_args, "vllm_gpu_memory_utilization", 0.85),
+                disable_multimodal=getattr(finetuning_args, "vllm_disable_multimodal", True),
+            )
+        else:
+            logger.info_rank0(
+                "vLLM disabled: world_size > 1 (DDP training). "
+                "Use CUDA_VISIBLE_DEVICES=0 for single-GPU vLLM training. "
+                "Multi-GPU vLLM support planned for Phase 2."
+            )
 
     # SDFT data collator (produces student/teacher input batches)
     data_collator = SDFTDataCollator(tokenizer, max_length=data_args.cutoff_len)
