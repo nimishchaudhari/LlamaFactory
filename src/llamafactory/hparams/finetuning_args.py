@@ -495,6 +495,10 @@ class FinetuningArguments(
         default=1,
         metadata={"help": "Completions to sample per prompt"},
     )
+    num_demonstrations: int = field(
+        default=2,
+        metadata={"help": "Number of few-shot demos prepended to teacher prompt"},
+    )
     use_vllm_for_generation: bool = field(
         default=True,
         metadata={"help": "Use vLLM for on-policy generation"},

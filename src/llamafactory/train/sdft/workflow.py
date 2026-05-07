@@ -76,6 +76,7 @@ def run_sdft(
         teacher_model_name=teacher_model_name,
         sync_teacher_every=finetuning_args.sync_teacher_every,
         num_generations=finetuning_args.num_generations,
+        num_demonstrations=finetuning_args.num_demonstrations,
         max_new_tokens=generating_args.max_new_tokens,
         temperature=generating_args.temperature,
         top_p=generating_args.top_p,

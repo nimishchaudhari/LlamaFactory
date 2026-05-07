@@ -54,6 +54,9 @@ class SDFTArguments:
     # vLLM integration
     use_vllm_for_generation: bool = field(default=True, metadata={"help": "Use LlamaFactory's vLLM for faster generation"})
 
+    # Demonstration buffer for teacher-conditioning
+    num_demonstrations: int = field(default=2, metadata={"help": "Number of few-shot demos to prepend to teacher prompt"})
+
 
 # =============================================================================
 # 2. Dual-Prompt Data Collator (supports teacher_prompt column)
@@ -263,6 +266,10 @@ class SDFTTrainerWrapper:
         # Track steps for teacher sync
         self.global_step = 0
 
+        # Demonstration buffer: stores (prompt_text, response_text) pairs for teacher conditioning
+        self._demo_buffer: list[tuple[str, str]] = []
+        self._demo_buffer_size = getattr(sdft_args, "num_demonstrations", 2) * 10  # ring buffer
+
         # Freeze teacher only if it's a separate model (not shared with student)
         if self.teacher_model is not None and self.teacher_model is not base_trainer.model:
             self.teacher_model.eval()
@@ -285,6 +292,33 @@ class SDFTTrainerWrapper:
         ):
             t_param.data.copy_(s_param.data)
             
+    def _build_teacher_prompt(self, student_prompt: str) -> str:
+        """Build a demonstration-conditioned teacher prompt by prepending few-shot examples.
+
+        SDFT requires the teacher to see demonstrations that the student doesn't.
+        This produces the distribution difference that KL divergence measures.
+        """
+        if not self._demo_buffer or self.args.num_demonstrations <= 0:
+            return student_prompt
+
+        import random
+
+        num_demos = min(self.args.num_demonstrations, len(self._demo_buffer))
+        demos = random.sample(self._demo_buffer, num_demos)
+        demo_text = "\n\n".join(f"Example {i+1}:\nQ: {q}\nA: {a}" for i, (q, a) in enumerate(demos))
+        return f"{demo_text}\n\nNow answer:\nQ: {student_prompt}\nA:"
+
+    def _update_demo_buffer(self, prompts: List[str], completions: List[str]) -> None:
+        """Store prompt-completion pairs for future use as teacher demonstrations."""
+        if self._demo_buffer_size <= 0:
+            return
+        for p, c in zip(prompts, completions):
+            # Store a truncated version to keep prompts manageable
+            self._demo_buffer.append((p[:512], c[:256]))
+        # Trim to ring buffer size
+        if len(self._demo_buffer) > self._demo_buffer_size:
+            self._demo_buffer = self._demo_buffer[-self._demo_buffer_size:]
+
     def _generate_completions_on_policy(
         self,
         prompts: List[str],
@@ -346,7 +380,7 @@ class SDFTTrainerWrapper:
         return_outputs: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict]]:
         """SDFT loss: KL(student||teacher) between full vocabulary distributions
-        on on-policy generated completions."""
+        on on-policy generated completions, with demonstration-conditioned teacher."""
         self.global_step += 1
 
         # 1. Decode student prompts and generate completions on-policy
@@ -354,83 +388,101 @@ class SDFTTrainerWrapper:
             self.tokenizer.decode(ids, skip_special_tokens=True)
             for ids in inputs["student_input_ids"]
         ]
-        _, completion_ids_list = self._generate_completions_on_policy(prompts_text, use_teacher=False)
+        completions_text, completion_ids_list = self._generate_completions_on_policy(
+            prompts_text, use_teacher=False
+        )
 
-        # 2. Keep prompt as token IDs (from collator), pad completions
-        prompt_ids_list = [ids for ids in inputs["student_input_ids"]]
-        prompt_ids = torch.nn.utils.rnn.pad_sequence(
-            prompt_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        # 1b. Build demonstration-conditioned teacher prompts
+        teacher_prompts_text = [self._build_teacher_prompt(p) for p in prompts_text]
+
+        # 1c. Feed the demo buffer with this batch (will be used in future steps)
+        self._update_demo_buffer(prompts_text, completions_text)
+
+        # 2. Pad student prompt IDs (from collator) and completion IDs
+        student_prompt_ids_list = [ids for ids in inputs["student_input_ids"]]
+        student_prompt_ids = torch.nn.utils.rnn.pad_sequence(
+            student_prompt_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
         completion_ids = torch.nn.utils.rnn.pad_sequence(
             completion_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
         completion_len = completion_ids.size(1)
 
-        # 3. Build full sequences (student: prompt + completion)
-        full_input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        full_attention = (full_input_ids != self.tokenizer.pad_token_id).long()
-        full_input_ids = full_input_ids.to(model.device)
-        full_attention = full_attention.to(model.device)
+        # 3. Student forward pass (student prompt + generated completions)
+        student_full_ids = torch.cat([student_prompt_ids, completion_ids], dim=1).to(model.device)
+        student_full_attn = (student_full_ids != self.tokenizer.pad_token_id).long()
 
-        # 4. Student forward pass
-        student_outputs = model(input_ids=full_input_ids, attention_mask=full_attention)
+        student_outputs = model(input_ids=student_full_ids, attention_mask=student_full_attn)
         student_logits = student_outputs.logits
 
-        # 5. Teacher forward pass (no grad) — with teacher_prompt + same completions
+        # 4. Teacher forward pass (demo-conditioned teacher prompt + same completions)
         with torch.no_grad():
-            teacher_prompt_ids_list = [ids for ids in inputs.get("teacher_input_ids", inputs["student_input_ids"])]
-            teacher_prompt_ids = torch.nn.utils.rnn.pad_sequence(
-                teacher_prompt_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id
+            teacher_prompt_enc = self.tokenizer(
+                teacher_prompts_text,
+                padding=True,
+                truncation=True,
+                max_length=self.tokenizer.model_max_length - completion_len,
+                return_tensors="pt",
             ).to(self.teacher_model.device)
-            teacher_full_ids = torch.cat([teacher_prompt_ids, completion_ids.to(self.teacher_model.device)], dim=1)
-            teacher_full_attn = (teacher_full_ids != self.tokenizer.pad_token_id).long()
 
-            teacher_outputs = self.teacher_model(input_ids=teacher_full_ids, attention_mask=teacher_full_attn)
+            teacher_prompt_ids = teacher_prompt_enc["input_ids"]
+            teacher_prompt_attn = teacher_prompt_enc["attention_mask"]
+
+            teacher_comp_ids = completion_ids.to(self.teacher_model.device)
+            teacher_comp_attn = (teacher_comp_ids != self.tokenizer.pad_token_id).long()
+
+            teacher_full_ids = torch.cat([teacher_prompt_ids, teacher_comp_ids], dim=1)
+            teacher_full_attn = torch.cat([teacher_prompt_attn, teacher_comp_attn], dim=1)
+
+            teacher_outputs = self.teacher_model(
+                input_ids=teacher_full_ids, attention_mask=teacher_full_attn
+            )
             teacher_logits = teacher_outputs.logits
 
-        # 6. Shift logits (pos i → predicts pos i+1) and trim to completion tokens
-        student_logits_comp = student_logits[:, -(completion_len + 1) : -1, :]  # [B, L_comp, V]
+        # 5. Trim logits to completion tokens (last completion_len positions, shifted)
+        student_logits_comp = student_logits[:, -(completion_len + 1) : -1, :]
         teacher_logits_comp = teacher_logits[:, -(completion_len + 1) : -1, :]
 
         student_full_logps = get_full_distribution_logps(student_logits_comp, shift=False)
         teacher_full_logps = get_full_distribution_logps(teacher_logits_comp, shift=False)
 
-        # 7. Completion mask (exclude pad tokens)
+        # 6. Completion mask (exclude pad tokens)
         completion_mask = (completion_ids != self.tokenizer.pad_token_id).float().to(model.device)
 
-        # Skip first N completion tokens
         if self.args.num_loss_tokens_to_skip > 0:
             completion_mask[:, : self.args.num_loss_tokens_to_skip] = 0
 
-        # 8. Entropy-based token filtering (from full distribution)
+        # 7. Entropy-based token filtering
         if self.args.top_entropy_quantile < 1.0:
             student_entropy = compute_entropy_from_logps(student_full_logps)
             completion_mask = completion_mask * filter_by_entropy(
                 student_entropy, self.args.top_entropy_quantile, completion_mask
             )
 
-        # 9. Compute KL divergence between full distributions
+        # 8. KL divergence between full distributions
         per_token_kl = compute_distribution_kl(
             student_full_logps, teacher_full_logps, self.args.alpha
         )  # [B, L_comp]
 
-        # 10. Apply mask and normalize
+        # 9. Apply mask and normalize
         masked_kl = (per_token_kl * completion_mask).sum(dim=-1)
         token_counts = completion_mask.sum(dim=-1).clamp(min=1.0)
         kl_loss = (masked_kl / token_counts).mean()
 
-        # 11. Optional beta-KL to frozen reference model
+        # 10. Optional beta-KL to frozen reference model
         total_loss = kl_loss
         if self.args.beta > 0.0 and hasattr(self.base, "ref_model") and self.base.ref_model is not None:
             with torch.no_grad():
-                ref_outputs = self.base.ref_model(input_ids=full_input_ids, attention_mask=full_attention)
+                ref_outputs = self.base.ref_model(
+                    input_ids=student_full_ids, attention_mask=student_full_attn
+                )
                 ref_logits_comp = ref_outputs.logits[:, -(completion_len + 1) : -1, :]
                 ref_full_logps = get_full_distribution_logps(ref_logits_comp, shift=False)
             ref_kl = compute_distribution_kl(student_full_logps, ref_full_logps, alpha=0.0)
             ref_masked_kl = (ref_kl * completion_mask).sum(dim=-1) / token_counts
             total_loss = total_loss + self.args.beta * ref_masked_kl.mean()
 
-        # 12. Sync teacher weights if shared
+        # 11. Sync teacher weights if shared
         if self.args.teacher_model_name is None and self.global_step % self.args.sync_teacher_every == 0:
             self._sync_teacher_weights()
 
