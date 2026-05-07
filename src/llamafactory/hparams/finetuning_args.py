@@ -515,6 +515,10 @@ class FinetuningArguments(
         default=True,
         metadata={"help": "Force text-only mode in vLLM even for multi-modal architectures"},
     )
+    vllm_disable_for_ddp: bool = field(
+        default=True,
+        metadata={"help": "Disable vLLM when training with DDP (world_size > 1)"},
+    )
     # === END SDFT ===
 
     use_llama_pro: bool = field(

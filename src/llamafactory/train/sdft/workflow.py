@@ -115,31 +115,39 @@ def run_sdft(
 
     vllm_engine = None
     try:
-        # Initialize vLLM engine (lazy: after model is on GPU, before training)
+        # Initialize vLLM engine (lazy: after model is on GPU, before training).
         # Placed inside try/finally so Ctrl+C cleans up vLLM worker processes.
+        #
+        # vLLM does NOT work with multi-GPU DDP — each rank spawns independent
+        # EngineCore processes that compete for memory and TCP ports. By default,
+        # vllm_disable_for_ddp=True skips vLLM when world_size > 1.
+        # Set false only when using tensor_parallel_size to split vLLM across GPUs.
         if finetuning_args.use_vllm_for_generation:
             import torch.distributed as dist
 
             world_size = dist.get_world_size() if dist.is_initialized() else 1
-            if world_size > 1:
-                logger.info_rank0(
-                    f"vLLM: world_size={world_size}. Each rank will independently create a vLLM engine. "
-                    "Ensure each GPU has enough free memory (training model + vLLM copy). "
-                    "If OOM occurs, individual ranks will fall back to model.generate()."
-                )
+            disable_for_ddp = getattr(finetuning_args, "vllm_disable_for_ddp", True)
 
-            vllm_engine = SDFTVLLMEngine(
-                model=model,
-                tokenizer=tokenizer,
-                model_name_or_path=model_args.model_name_or_path,
-                cutoff_len=data_args.cutoff_len,
-                max_new_tokens=generating_args.max_new_tokens,
-                temperature=generating_args.temperature,
-                top_p=generating_args.top_p,
-                gpu_memory_utilization=getattr(finetuning_args, "vllm_gpu_memory_utilization", 0.85),
-                disable_multimodal=getattr(finetuning_args, "vllm_disable_multimodal", True),
-            )
-            sdft_trainer.vllm_engine = vllm_engine  # inject after wrapper creation
+            if world_size > 1 and disable_for_ddp:
+                logger.info_rank0(
+                    "vLLM disabled for DDP (vllm_disable_for_ddp=True). "
+                    "Each GPU runs training + vLLM → exceeds 24GB memory budget. "
+                    "Use CUDA_VISIBLE_DEVICES=0 for single-GPU vLLM training, "
+                    "or set vllm_disable_for_ddp=False to attempt anyway."
+                )
+            else:
+                vllm_engine = SDFTVLLMEngine(
+                    model=model,
+                    tokenizer=tokenizer,
+                    model_name_or_path=model_args.model_name_or_path,
+                    cutoff_len=data_args.cutoff_len,
+                    max_new_tokens=generating_args.max_new_tokens,
+                    temperature=generating_args.temperature,
+                    top_p=generating_args.top_p,
+                    gpu_memory_utilization=getattr(finetuning_args, "vllm_gpu_memory_utilization", 0.85),
+                    disable_multimodal=getattr(finetuning_args, "vllm_disable_multimodal", True),
+                )
+                sdft_trainer.vllm_engine = vllm_engine
 
         # Training (runs through base_trainer with SDFT-patched compute_loss)
         if training_args.do_train:
