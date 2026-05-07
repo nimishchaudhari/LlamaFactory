@@ -98,6 +98,11 @@ vllm_disable_multimodal: true
   # Force text-only mode in vLLM, even for multi-modal architectures (Qwen3, etc.).
   # Set to false only when your dataset includes images/video/audio.
 
+vllm_disable_for_ddp: false
+  # Allow vLLM on both GPUs during DDP training (default: true = skip vLLM with DDP).
+  # Each GPU gets its own vLLM engine. Works if memory fits (4B model: ~18GB/GPU).
+  # Set true if you hit OOM or TCP timeout; training falls back to model.generate().
+
 vllm_sync_every: 32
   # Sync training weights to vLLM engine every N steps. Phase 2 feature — currently
   # a no-op (engine created once at init, no weight updates during training).
